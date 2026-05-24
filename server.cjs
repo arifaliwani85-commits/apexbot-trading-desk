@@ -419,29 +419,37 @@ try {
   const envPath = path.join(__dirname, '.env');
   if (fs.existsSync(envPath)) {
     dotenv.config({ path: envPath });
-    if (process.env.EXCHANGE_API_KEY && process.env.EXCHANGE_API_SECRET) {
-      exchangeConfig = {
-        exchangeId: process.env.EXCHANGE_ID || 'binance',
-        apiKey: process.env.EXCHANGE_API_KEY,
-        apiSecret: process.env.EXCHANGE_API_SECRET,
-        isTestnet: process.env.EXCHANGE_IS_TESTNET === 'true',
-      };
-      
-      const config = {
-        apiKey: exchangeConfig.apiKey,
-        secret: exchangeConfig.apiSecret,
-        enableRateLimit: true,
-      };
+  } else {
+    dotenv.config();
+  }
 
-      const exchangeClass = ccxt[exchangeConfig.exchangeId];
-      if (exchangeClass) {
-        exchangeInstance = new exchangeClass(config);
-        if (exchangeConfig.isTestnet && exchangeInstance.setSandboxMode) {
-          exchangeInstance.setSandboxMode(true);
-        }
-        connectionStatus = 'CONNECTED';
-        addLog(`Auto-loaded credentials. Connected to ${exchangeConfig.exchangeId.toUpperCase()} (${exchangeConfig.isTestnet ? 'TESTNET' : 'MAINNET'}).`, 'success');
+  const apiKey = process.env.EXCHANGE_API_KEY || process.env.BYBIT_API_KEY;
+  const apiSecret = process.env.EXCHANGE_API_SECRET || process.env.BYBIT_API_SECRET;
+  const exchangeId = process.env.EXCHANGE_ID || (process.env.BYBIT_API_KEY ? 'bybit' : 'binance');
+  const isTestnet = process.env.EXCHANGE_IS_TESTNET !== 'false' && process.env.BYBIT_IS_TESTNET !== 'false';
+
+  if (apiKey && apiSecret) {
+    exchangeConfig = {
+      exchangeId,
+      apiKey,
+      apiSecret,
+      isTestnet,
+    };
+    
+    const config = {
+      apiKey: exchangeConfig.apiKey,
+      secret: exchangeConfig.apiSecret,
+      enableRateLimit: true,
+    };
+
+    const exchangeClass = ccxt[exchangeConfig.exchangeId];
+    if (exchangeClass) {
+      exchangeInstance = new exchangeClass(config);
+      if (exchangeConfig.isTestnet && exchangeInstance.setSandboxMode) {
+        exchangeInstance.setSandboxMode(true);
       }
+      connectionStatus = 'CONNECTED';
+      addLog(`Auto-loaded credentials from environment. Connected to ${exchangeConfig.exchangeId.toUpperCase()} (${exchangeConfig.isTestnet ? 'TESTNET' : 'MAINNET'}).`, 'success');
     }
   }
 } catch (e) {
