@@ -274,13 +274,19 @@ setTimeout(initAllActiveSessions, 1000);
 
 // --- Exchange & Sizing & Logging Helpers ---
 function getMarketSymbol(session, symbol) {
+  let target = symbol;
+  // Map MATIC to POL on Bybit (since Bybit completed MATIC -> POL migration)
   if (session.exchangeInstance && session.exchangeConfig.exchangeId === 'bybit') {
-    const swapSymbol = `${symbol}:USDT`;
+    if (target === 'MATIC/USDT') {
+      target = 'POL/USDT';
+    }
+    const swapSymbol = `${target}:USDT`;
     if (session.exchangeInstance.markets && session.exchangeInstance.markets[swapSymbol]) {
       return swapSymbol;
     }
+    return swapSymbol; // Fallback to swap format directly if markets not loaded yet
   }
-  return symbol;
+  return target;
 }
 
 function getMinOrderSize(session, marketSymbol, price) {
@@ -1032,7 +1038,7 @@ app.post('/api/disconnect', requireAuth, (req, res) => {
 app.get('/api/status', requireAuth, async (req, res) => {
   const session = req.userSession;
   const clientSymbol = req.query.symbol;
-  if (clientSymbol && session.activeSymbols.includes(clientSymbol)) {
+  if (clientSymbol) {
     session.currentSymbol = clientSymbol;
     
     const profile = loadUserProfile(session.username);
@@ -1316,11 +1322,15 @@ setInterval(async () => {
 
       if (session.circuitBreakerTriggered || !session.botActive) continue;
 
+      // Only process the selected symbol plus any symbol that currently has an active open position (to handle monitoring/closing)
+      const activePositionsSymbols = Object.keys(session.activePositions).filter(k => session.activePositions[k]);
+      const symbolsToProcess = Array.from(new Set([session.currentSymbol || 'BTC/USDT', ...activePositionsSymbols])).filter(Boolean);
+
       // Fetch active exchange positions for safety sync to prevent double-entries
       let exchangePositionsMap = {};
       try {
         if (session.exchangeInstance.has['fetchPositions']) {
-          const symbolsForFetch = session.activeSymbols.map(s => getMarketSymbol(session, s));
+          const symbolsForFetch = symbolsToProcess.map(s => getMarketSymbol(session, s));
           const positions = await session.exchangeInstance.fetchPositions(symbolsForFetch);
           for (const p of positions) {
             const baseSymbol = p.symbol.split(':')[0]; // e.g. BTC/USDT:USDT -> BTC/USDT
@@ -1335,8 +1345,8 @@ setInterval(async () => {
         console.error(`Failed to fetch exchange positions for ${session.username}:`, posErr.message);
       }
 
-      // 3. Process portfolio symbols sequentially (respect rate limits)
-      for (const symbol of session.activeSymbols) {
+      // 3. Process the active/selected symbol and open positions sequentially (respect rate limits)
+      for (const symbol of symbolsToProcess) {
         try {
           const marketSymbol = getMarketSymbol(session, symbol);
           const timeframe = '5m';
