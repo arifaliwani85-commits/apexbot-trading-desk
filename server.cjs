@@ -228,6 +228,7 @@ function getOrCreateSession(username) {
             apiKey: creds.apiKey,
             secret: creds.apiSecret,
             enableRateLimit: true,
+            timeout: 10000,
           });
           if (creds.isTestnet && session.exchangeInstance.setSandboxMode) {
             session.exchangeInstance.setSandboxMode(true);
@@ -965,6 +966,7 @@ app.post('/api/connect', requireAuth, async (req, res) => {
       apiKey,
       secret: apiSecret,
       enableRateLimit: true,
+      timeout: 10000,
     });
 
     if (isTestnet && testExchange.setSandboxMode) {
@@ -1350,7 +1352,7 @@ setInterval(async () => {
         try {
           const marketSymbol = getMarketSymbol(session, symbol);
           const timeframe = '5m';
-          const ohlcv = await session.exchangeInstance.fetchOHLCV(marketSymbol, timeframe, undefined, 100);
+          const ohlcv = await session.exchangeInstance.fetchOHLCV(marketSymbol, timeframe, undefined, 500);
 
           const fetchedCandles = ohlcv.map((c) => ({
             time: c[0],
@@ -1557,7 +1559,7 @@ setInterval(async () => {
           // Check Multi-Timeframe Trend filter (using 1H for 5m strategy macro filter)
           if (session.stratSettings.useMultiTimeframe) {
             try {
-              const ohlcvMacro = await session.exchangeInstance.fetchOHLCV(marketSymbol, '1h', undefined, 50);
+              const ohlcvMacro = await session.exchangeInstance.fetchOHLCV(marketSymbol, '1h', undefined, 100);
               const closesMacro = ohlcvMacro.map((c) => c[4]);
               const ema20_macro = calculateEMA(closesMacro, 20);
               const ema50_macro = calculateEMA(closesMacro, 50);
