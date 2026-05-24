@@ -266,36 +266,29 @@ function checkHighFrequencyScalper(
   if (len < 5) return { signal: null, reason: 'Insufficient data' };
 
   const current = candles[len - 1];
-  const previous = candles[len - 2];
 
   const { ema20: emaShortCurr, ema50: emaLongCurr, rsi: rsiCurr } = current;
-  const { ema20: emaShortPrev, ema50: emaLongPrev } = previous;
 
   if (
     emaShortCurr === undefined ||
     emaLongCurr === undefined ||
-    emaShortPrev === undefined ||
-    emaLongPrev === undefined ||
     rsiCurr === undefined
   ) {
     return { signal: null, reason: 'Indicators not fully calculated' };
   }
 
-  // Fast crossover strategy
-  const isGoldenCross = emaShortPrev <= emaLongPrev && emaShortCurr > emaLongCurr;
-  const isDeathCross = emaShortPrev >= emaLongPrev && emaShortCurr < emaLongCurr;
-
-  if (isGoldenCross) {
+  // Active state entry: BUY if short EMA > long EMA, SELL if short EMA < long EMA
+  if (emaShortCurr > emaLongCurr) {
     return {
       signal: 'BUY',
-      reason: `HF Scalper: EMA Short crossed above EMA Long on 5m chart. (RSI: ${rsiCurr.toFixed(1)})`,
+      reason: `HF Scalper: EMA Short (${emaShortCurr.toFixed(2)}) > EMA Long (${emaLongCurr.toFixed(2)}) on 5m chart. (RSI: ${rsiCurr.toFixed(1)})`,
     };
   }
 
-  if (isDeathCross) {
+  if (emaShortCurr < emaLongCurr) {
     return {
       signal: 'SELL',
-      reason: `HF Scalper: EMA Short crossed below EMA Long on 5m chart. (RSI: ${rsiCurr.toFixed(1)})`,
+      reason: `HF Scalper: EMA Short (${emaShortCurr.toFixed(2)}) < EMA Long (${emaLongCurr.toFixed(2)}) on 5m chart. (RSI: ${rsiCurr.toFixed(1)})`,
     };
   }
 

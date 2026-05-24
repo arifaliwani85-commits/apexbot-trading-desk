@@ -117,7 +117,7 @@ export default function App() {
     maskedApiKey: '',
     maskedApiSecret: '',
   });
-  const [symbol, setSymbol] = useState('BTC/USDT, ETH/USDT, SOL/USDT, DOGE/USDT, ALGO/USDT, ADA/USDT, XRP/USDT, LTC/USDT, LINK/USDT, DOT/USDT, AVAX/USDT');
+  const [symbol, setSymbol] = useState('BTC/USDT, ETH/USDT, SOL/USDT, DOGE/USDT, ALGO/USDT, ADA/USDT, XRP/USDT, LTC/USDT, LINK/USDT, DOT/USDT, AVAX/USDT, BNB/USDT, NEAR/USDT, MATIC/USDT, UNI/USDT, SUI/USDT, APT/USDT');
   const [viewedSymbol, setViewedSymbol] = useState('BTC/USDT');
 
   // --- Account State ---

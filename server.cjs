@@ -167,7 +167,7 @@ function getOrCreateSession(username) {
     },
     botActive: profile.botActive || false,
     currentSymbol: profile.currentSymbol || 'BTC/USDT',
-    activeSymbols: profile.activeSymbols || ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'DOGE/USDT', 'ALGO/USDT', 'ADA/USDT', 'XRP/USDT', 'LTC/USDT', 'LINK/USDT', 'DOT/USDT', 'AVAX/USDT'],
+    activeSymbols: profile.activeSymbols || ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'DOGE/USDT', 'ALGO/USDT', 'ADA/USDT', 'XRP/USDT', 'LTC/USDT', 'LINK/USDT', 'DOT/USDT', 'AVAX/USDT', 'BNB/USDT', 'NEAR/USDT', 'MATIC/USDT', 'UNI/USDT', 'SUI/USDT', 'APT/USDT'],
     activePositions: {},
     closedTrades: profile.closedTrades || [],
     botLogs: [],
@@ -572,16 +572,15 @@ function evaluateStrategyRules(candlesList, stratSettings) {
     }
   } else if (stratSettings.strategyType === 'HIGH_FREQUENCY_SCALPER') {
     const { ema20, ema50, rsi } = current;
-    const { ema20: emaShortPrev, ema50: emaLongPrev } = previous;
     
-    if (!ema20 || !ema50 || !emaShortPrev || !emaLongPrev || !rsi) return { signal: null };
+    if (!ema20 || !ema50 || !rsi) return { signal: null };
 
-    // fast crossover
-    if (emaShortPrev <= emaLongPrev && ema20 > ema50) {
-      return { signal: 'BUY', reason: `High-Frequency Scalper: EMA Short (${ema20.toFixed(2)}) crossed above EMA Long (${ema50.toFixed(2)}) on 5m chart` };
+    // Active state entry: BUY if short EMA > long EMA, SELL if short EMA < long EMA
+    if (ema20 > ema50) {
+      return { signal: 'BUY', reason: `High-Frequency Scalper: EMA Short (${ema20.toFixed(2)}) > EMA Long (${ema50.toFixed(2)}) on 5m chart` };
     }
-    if (emaShortPrev >= emaLongPrev && ema20 < ema50) {
-      return { signal: 'SELL', reason: `High-Frequency Scalper: EMA Short (${ema20.toFixed(2)}) crossed below EMA Long (${ema50.toFixed(2)}) on 5m chart` };
+    if (ema20 < ema50) {
+      return { signal: 'SELL', reason: `High-Frequency Scalper: EMA Short (${ema20.toFixed(2)}) < EMA Long (${ema50.toFixed(2)}) on 5m chart` };
     }
   } else if (stratSettings.strategyType === 'MEAN_REVERSION') {
     const { bbLower, bbUpper, rsi } = current;
@@ -683,7 +682,7 @@ app.post('/api/auth/register', (req, res) => {
     encryptedExchangeConfig: '',
     botActive: false,
     currentSymbol: 'BTC/USDT',
-    activeSymbols: ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'DOGE/USDT', 'ALGO/USDT', 'ADA/USDT', 'XRP/USDT', 'LTC/USDT', 'LINK/USDT', 'DOT/USDT', 'AVAX/USDT'],
+    activeSymbols: ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'DOGE/USDT', 'ALGO/USDT', 'ADA/USDT', 'XRP/USDT', 'LTC/USDT', 'LINK/USDT', 'DOT/USDT', 'AVAX/USDT', 'BNB/USDT', 'NEAR/USDT', 'MATIC/USDT', 'UNI/USDT', 'SUI/USDT', 'APT/USDT'],
     closedTrades: [],
     stratSettings: {
       strategyType: 'TREND_FOLLOWING',
@@ -1238,7 +1237,7 @@ setInterval(async () => {
             if (session.cooldowns[symbol]) {
               const elapsed = Date.now() - session.cooldowns[symbol];
               const isHighFreq = session.stratSettings.strategyType === 'HIGH_FREQUENCY_SCALPER';
-              const cooldownLimit = isHighFreq ? 0 : 15 * 60 * 1000;
+              const cooldownLimit = isHighFreq ? 5 * 60 * 1000 : 15 * 60 * 1000; // 5 minute cooldown for HF scalper, 15 minutes otherwise
               if (elapsed < cooldownLimit) {
                 // Still in cooldown
                 continue;
