@@ -167,7 +167,7 @@ function getOrCreateSession(username) {
     },
     botActive: profile.botActive || false,
     currentSymbol: profile.currentSymbol || 'BTC/USDT',
-    activeSymbols: profile.activeSymbols || ['BTC/USDT', 'ETH/USDT', 'SOL/USDT'],
+    activeSymbols: profile.activeSymbols || ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'DOGE/USDT', 'ALGO/USDT', 'ADA/USDT'],
     activePositions: {},
     closedTrades: profile.closedTrades || [],
     botLogs: [],
@@ -232,6 +232,7 @@ function getOrCreateSession(username) {
             session.exchangeInstance.setSandboxMode(true);
           }
           session.connectionStatus = 'CONNECTED';
+          session.exchangeInstance.loadMarkets().catch(e => console.error('Failed to load markets:', e));
           session.addLog(`Auto-loaded exchange keys. Connected to ${creds.exchangeId.toUpperCase()} (${creds.isTestnet ? 'TESTNET' : 'MAINNET'}).`, 'success');
         }
       }
@@ -569,6 +570,19 @@ function evaluateStrategyRules(candlesList, stratSettings) {
         }
       }
     }
+  } else if (stratSettings.strategyType === 'HIGH_FREQUENCY_SCALPER') {
+    const { ema20, ema50, rsi } = current;
+    const { ema20: emaShortPrev, ema50: emaLongPrev } = previous;
+    
+    if (!ema20 || !ema50 || !emaShortPrev || !emaLongPrev || !rsi) return { signal: null };
+
+    // fast crossover
+    if (emaShortPrev <= emaLongPrev && ema20 > ema50) {
+      return { signal: 'BUY', reason: `High-Frequency Scalper: EMA Short (${ema20.toFixed(2)}) crossed above EMA Long (${ema50.toFixed(2)}) on 5m chart` };
+    }
+    if (emaShortPrev >= emaLongPrev && ema20 < ema50) {
+      return { signal: 'SELL', reason: `High-Frequency Scalper: EMA Short (${ema20.toFixed(2)}) crossed below EMA Long (${ema50.toFixed(2)}) on 5m chart` };
+    }
   } else if (stratSettings.strategyType === 'MEAN_REVERSION') {
     const { bbLower, bbUpper, rsi } = current;
     const { bbLower: bbLowerPrev, bbUpper: bbUpperPrev } = previous;
@@ -669,7 +683,7 @@ app.post('/api/auth/register', (req, res) => {
     encryptedExchangeConfig: '',
     botActive: false,
     currentSymbol: 'BTC/USDT',
-    activeSymbols: ['BTC/USDT', 'ETH/USDT', 'SOL/USDT'],
+    activeSymbols: ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'DOGE/USDT', 'ALGO/USDT', 'ADA/USDT'],
     closedTrades: [],
     stratSettings: {
       strategyType: 'TREND_FOLLOWING',
@@ -760,7 +774,7 @@ app.post('/api/connect', requireAuth, async (req, res) => {
       testExchange.setSandboxMode(true);
     }
 
-    // Fetch balance to validate the API key works
+    await testExchange.loadMarkets();
     const balanceData = await testExchange.fetchBalance();
     
     // Success: Update session state
@@ -889,6 +903,9 @@ app.get('/api/status', requireAuth, async (req, res) => {
     // Add masked configuration credentials
     maskedApiKey: session.exchangeConfig.apiKey ? `${session.exchangeConfig.apiKey.slice(0, 4)}...${session.exchangeConfig.apiKey.slice(-4)}` : '',
     maskedApiSecret: session.exchangeConfig.apiSecret ? '********************************' : '',
+    // Add settings
+    stratSettings: session.stratSettings,
+    riskSettings: session.riskSettings,
   });
 });
 
@@ -968,8 +985,23 @@ async function executeCloseOrder(session, symbol, reason, customSize = null) {
     let fillPrice = tickerPrice;
 
     if (session.exchangeInstance) {
+      let finalCloseSize = sizeToClose;
+      if (session.exchangeInstance.markets && session.exchangeInstance.markets[symbol]) {
+        try {
+          finalCloseSize = parseFloat(session.exchangeInstance.amountToPrecision(symbol, sizeToClose));
+        } catch (e) {
+          finalCloseSize = parseFloat(sizeToClose.toFixed(4));
+        }
+      } else {
+        finalCloseSize = parseFloat(sizeToClose.toFixed(4));
+      }
+
+      if (finalCloseSize <= 0) {
+        finalCloseSize = sizeToClose;
+      }
+
       // Place real market order on exchange to close
-      const order = await session.exchangeInstance.createMarketOrder(symbol, closeSide, sizeToClose);
+      const order = await session.exchangeInstance.createMarketOrder(symbol, closeSide, finalCloseSize);
       fillPrice = order.price || order.average || tickerPrice;
       session.addLog(`Exchange Fill success for ${symbol}. Closed size ${sizeToClose.toFixed(4)} at average price $${fillPrice}.`, 'success');
     } else {
@@ -1202,10 +1234,11 @@ setInterval(async () => {
           // Evaluate entries
           const openCount = Object.values(session.activePositions).filter(Boolean).length;
           if (!pos && openCount < session.riskSettings.maxConcurrentPositions) {
-            // Check 3-candle cooldown (15 minutes on 5m candles)
+            // Check 3-candle cooldown (15 minutes on 5m candles, skipped for HF Scalper)
             if (session.cooldowns[symbol]) {
               const elapsed = Date.now() - session.cooldowns[symbol];
-              const cooldownLimit = 15 * 60 * 1000; // 3 candles * 5 minutes
+              const isHighFreq = session.stratSettings.strategyType === 'HIGH_FREQUENCY_SCALPER';
+              const cooldownLimit = isHighFreq ? 0 : 15 * 60 * 1000;
               if (elapsed < cooldownLimit) {
                 // Still in cooldown
                 continue;
@@ -1263,14 +1296,37 @@ setInterval(async () => {
                 const maxLossUsd = exchangeBalance * (session.riskSettings.riskPercent / 100);
                 let size = maxLossUsd / slDistance;
 
-                const exposure = size * tickerPrice;
+                // Adjust to minimum order value of 5 USDT to ensure Bybit executes it for small balances
+                let exposure = size * tickerPrice;
+                const minOrderValue = 5.0;
+                if (exposure < minOrderValue && exchangeBalance >= minOrderValue) {
+                  size = minOrderValue / tickerPrice;
+                  exposure = size * tickerPrice;
+                }
+
+                // Check exposure limits
                 const maxAllowed = exchangeBalance * session.riskSettings.leverage;
                 if (exposure > maxAllowed) {
                   size = maxAllowed / tickerPrice;
                 }
 
+                // Round size to exchange precision
+                if (session.exchangeInstance && session.exchangeInstance.markets && session.exchangeInstance.markets[symbol]) {
+                  try {
+                    size = parseFloat(session.exchangeInstance.amountToPrecision(symbol, size));
+                  } catch (e) {
+                    size = parseFloat(size.toFixed(4));
+                  }
+                } else {
+                  size = parseFloat(size.toFixed(4));
+                }
+
+                if (size <= 0) {
+                  throw new Error(`Calculated size ${size} is too small to execute on exchange.`);
+                }
+
                 const tradeSide = decision.signal === 'BUY' ? 'buy' : 'sell';
-                session.addLog(`Sending Entry Order (${tradeSide.toUpperCase()}) for ${size.toFixed(4)} ${symbol} to Exchange...`, 'info');
+                session.addLog(`Sending Entry Order (${tradeSide.toUpperCase()}) for ${size} ${symbol} to Exchange...`, 'info');
 
                 const order = await session.exchangeInstance.createMarketOrder(symbol, tradeSide, size);
                 const fillPrice = order.price || order.average || tickerPrice;

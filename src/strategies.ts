@@ -23,6 +23,8 @@ export function evaluateStrategy(
       return checkMeanReversion(candles, settings);
     case 'MOMENTUM_BREAKOUT':
       return checkMomentumBreakout(candles, settings);
+    case 'HIGH_FREQUENCY_SCALPER':
+      return checkHighFrequencyScalper(candles, settings);
     default:
       return { signal: null, reason: 'Unknown strategy type' };
   }
@@ -254,4 +256,48 @@ function checkMomentumBreakout(
   }
 
   return { signal: null, reason: 'Price is consolidating within range' };
+}
+
+function checkHighFrequencyScalper(
+  candles: Candle[],
+  _settings: StrategySettings
+): SignalResult {
+  const len = candles.length;
+  if (len < 5) return { signal: null, reason: 'Insufficient data' };
+
+  const current = candles[len - 1];
+  const previous = candles[len - 2];
+
+  const { ema20: emaShortCurr, ema50: emaLongCurr, rsi: rsiCurr } = current;
+  const { ema20: emaShortPrev, ema50: emaLongPrev } = previous;
+
+  if (
+    emaShortCurr === undefined ||
+    emaLongCurr === undefined ||
+    emaShortPrev === undefined ||
+    emaLongPrev === undefined ||
+    rsiCurr === undefined
+  ) {
+    return { signal: null, reason: 'Indicators not fully calculated' };
+  }
+
+  // Fast crossover strategy
+  const isGoldenCross = emaShortPrev <= emaLongPrev && emaShortCurr > emaLongCurr;
+  const isDeathCross = emaShortPrev >= emaLongPrev && emaShortCurr < emaLongCurr;
+
+  if (isGoldenCross) {
+    return {
+      signal: 'BUY',
+      reason: `HF Scalper: EMA Short crossed above EMA Long on 5m chart. (RSI: ${rsiCurr.toFixed(1)})`,
+    };
+  }
+
+  if (isDeathCross) {
+    return {
+      signal: 'SELL',
+      reason: `HF Scalper: EMA Short crossed below EMA Long on 5m chart. (RSI: ${rsiCurr.toFixed(1)})`,
+    };
+  }
+
+  return { signal: null, reason: 'No crossover detected' };
 }

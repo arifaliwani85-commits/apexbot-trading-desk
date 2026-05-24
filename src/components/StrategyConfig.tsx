@@ -39,6 +39,7 @@ interface StrategyConfigProps {
   onDisconnectExchange: () => void;
   symbol: string;
   setSymbol: (s: string) => void;
+  hasUnappliedChanges?: boolean;
 }
 
 export const StrategyConfig: React.FC<StrategyConfigProps> = ({
@@ -57,6 +58,7 @@ export const StrategyConfig: React.FC<StrategyConfigProps> = ({
   onDisconnectExchange,
   symbol,
   setSymbol,
+  hasUnappliedChanges = false,
 }) => {
   const [exchangeId, setExchangeId] = useState('binance');
   const [apiKey, setApiKey] = useState('');
@@ -197,6 +199,22 @@ export const StrategyConfig: React.FC<StrategyConfigProps> = ({
         {botMode === 'EXCHANGE_LIVE' && !exchangeStatus.connected && (
           <div style={{ fontSize: '10px', color: 'var(--accent-red)', marginTop: '6px', textAlign: 'center' }}>
             ⚠️ You must connect your API keys below first.
+          </div>
+        )}
+        {hasUnappliedChanges && (
+          <div style={{
+            background: 'rgba(245, 158, 11, 0.1)',
+            border: '1px solid var(--accent-gold)',
+            color: 'var(--accent-gold)',
+            borderRadius: 'var(--radius-md)',
+            padding: '10px',
+            fontSize: '12px',
+            textAlign: 'center',
+            fontWeight: 'bold',
+            marginTop: '10px',
+            boxShadow: '0 0 10px rgba(245, 158, 11, 0.15)',
+          }}>
+            ⚠️ Settings changed! Click "{botMode === 'EXCHANGE_LIVE' ? 'START EXCHANGE BOT' : 'START SIMULATOR'}" above to apply changes.
           </div>
         )}
       </div>
@@ -533,6 +551,7 @@ export const StrategyConfig: React.FC<StrategyConfigProps> = ({
             <option value="TREND_FOLLOWING">EMA Golden Cross + RSI</option>
             <option value="MEAN_REVERSION">Bollinger Bands + RSI</option>
             <option value="MOMENTUM_BREAKOUT">Momentum Breakout (ATR)</option>
+            <option value="HIGH_FREQUENCY_SCALPER">High-Frequency Scalper (EMA Cross + RSI)</option>
           </select>
         </div>
 

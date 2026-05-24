@@ -117,7 +117,7 @@ export default function App() {
     maskedApiKey: '',
     maskedApiSecret: '',
   });
-  const [symbol, setSymbol] = useState('BTC/USDT, ETH/USDT, SOL/USDT');
+  const [symbol, setSymbol] = useState('BTC/USDT, ETH/USDT, SOL/USDT, DOGE/USDT, ALGO/USDT, ADA/USDT');
   const [viewedSymbol, setViewedSymbol] = useState('BTC/USDT');
 
   // --- Account State ---
@@ -135,6 +135,18 @@ export default function App() {
 
   // --- Backtest Results State ---
   const [backtestResults, setBacktestResults] = useState<BacktestResults | null>(null);
+
+  const [hasUnappliedChanges, setHasUnappliedChanges] = useState(false);
+  const isFirstRender = useRef(true);
+
+  // Track settings edits to show unapplied changes prompt
+  useEffect(() => {
+    if (isFirstRender.current) {
+      isFirstRender.current = false;
+      return;
+    }
+    setHasUnappliedChanges(true);
+  }, [stratSettings, riskSettings, symbol]);
 
   // Refs for tracking counts and ticking
   const tickCountRef = useRef(0);
@@ -194,6 +206,13 @@ export default function App() {
           });
           setBotActive(data.botActive);
           setAllPositions(data.allPositions || []);
+
+          // Auto-sync backend active settings to UI if no unapplied changes are pending
+          if (!hasUnappliedChanges) {
+            if (data.stratSettings) setStratSettings(data.stratSettings);
+            if (data.riskSettings) setRiskSettings(data.riskSettings);
+            if (data.activeSymbols) setSymbol(data.activeSymbols.join(', '));
+          }
           
           if (data.activePosition) {
             setActivePosition(data.activePosition);
@@ -243,7 +262,7 @@ export default function App() {
     }, 2000);
 
     return () => clearInterval(interval);
-  }, [botMode, viewedSymbol, userToken]);
+  }, [botMode, viewedSymbol, userToken, hasUnappliedChanges]);
 
   const handleConnectExchange = async (
     exchangeId: string,
@@ -332,12 +351,14 @@ export default function App() {
         }
         if (res.ok) {
           setBotActive(newActiveState);
+          setHasUnappliedChanges(false); // Reset on apply
         }
       } catch (e) {
         console.error('Error toggling bot:', e);
       }
     } else {
       setBotActive(newActiveState);
+      setHasUnappliedChanges(false); // Reset on apply
     }
   };
 
@@ -755,6 +776,7 @@ export default function App() {
           onDisconnectExchange={handleDisconnectExchange}
           symbol={symbol}
           setSymbol={setSymbol}
+          hasUnappliedChanges={hasUnappliedChanges}
         />
 
         {/* Middle Charting & Backtesting Panels */}
