@@ -324,7 +324,7 @@ async function safeCreateMarketOrder(exchangeInstance, symbol, side, amount, par
   for (let i = 1; i <= attempts; i++) {
     try {
       addLog(`Sending Market Order to Exchange (Attempt ${i}/${attempts}): ${side.toUpperCase()} ${amount} ${symbol} (params: ${JSON.stringify(params)})`, 'info');
-      const order = await exchangeInstance.createMarketOrder(symbol, side, amount, params);
+      const order = await exchangeInstance.createMarketOrder(symbol, side, amount, undefined, params);
       return order;
     } catch (err) {
       const isTransient = (ccxtLib.NetworkError && err instanceof ccxtLib.NetworkError) ||
