@@ -37,7 +37,7 @@ function checkTrendFollowing(
   const { ema20: emaShortCurr, ema50: emaLongCurr, ema200: emaTrendCurr, rsi: rsiCurr, adx: adxCurr, vwap: vwapCurr } = current;
   const { ema20: emaShortPrev, ema50: emaLongPrev } = previous;
 
-  const threshold = settings.adxThreshold || 25;
+  const threshold = settings.adxThreshold !== undefined ? settings.adxThreshold : 30;
 
   if (
     emaShortCurr === undefined ||
@@ -57,8 +57,8 @@ function checkTrendFollowing(
   const rsiNotOverbought = rsiCurr < settings.rsiOverbought;
   const hasStrongTrend = adxCurr > threshold;
   
-  // Risk control: Buy when price is not too far above VWAP (e.g. within 2.5% of VWAP)
-  const nearVWAPBuy = current.close <= vwapCurr * 1.025;
+  // Risk control: Buy when price is not too far above VWAP (within 0.2% of VWAP for 5m conservative entries)
+  const nearVWAPBuy = current.close <= vwapCurr * 1.002;
 
   if (isGoldenCross) {
     if (isUpTrend && rsiNotOverbought && hasStrongTrend && nearVWAPBuy) {
@@ -82,8 +82,8 @@ function checkTrendFollowing(
   const isDownTrend = current.close < emaTrendCurr;
   const rsiNotOversold = rsiCurr > settings.rsiOversold;
   
-  // Risk control: Short when price is not too far below VWAP (e.g. within 2.5% of VWAP)
-  const nearVWAPSell = current.close >= vwapCurr * 0.975;
+  // Risk control: Short when price is not too far below VWAP (within 0.2% of VWAP for 5m conservative entries)
+  const nearVWAPSell = current.close >= vwapCurr * 0.998;
 
   if (isDeathCross) {
     if (isDownTrend && rsiNotOversold && hasStrongTrend && nearVWAPSell) {

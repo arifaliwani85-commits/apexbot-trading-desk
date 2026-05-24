@@ -32,6 +32,8 @@ interface StrategyConfigProps {
     equity?: number;
     dailyDrawdownPercent?: number;
     circuitBreakerTriggered?: boolean;
+    maskedApiKey?: string;
+    maskedApiSecret?: string;
   };
   onConnectExchange: (exchangeId: string, apiKey: string, apiSecret: string, isTestnet: boolean) => Promise<boolean>;
   onDisconnectExchange: () => void;
@@ -73,8 +75,8 @@ export const StrategyConfig: React.FC<StrategyConfigProps> = ({
   const handleEditClick = () => {
     setExchangeId(exchangeStatus.exchangeId || 'binance');
     setIsTestnet(exchangeStatus.isTestnet !== false);
-    setApiKey('');
-    setApiSecret('');
+    setApiKey(exchangeStatus.maskedApiKey || '');
+    setApiSecret(exchangeStatus.maskedApiSecret || '');
     setIsEditing(false); // Reset editing first to refresh form
     setTimeout(() => setIsEditing(true), 0);
   };

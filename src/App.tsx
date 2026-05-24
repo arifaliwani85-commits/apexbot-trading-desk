@@ -21,8 +21,39 @@ import {
   Activity,
   CheckCircle,
 } from 'lucide-react';
+import { AuthPage } from './components/AuthPage';
 
 export default function App() {
+  // --- Auth States ---
+  const [userToken, setUserToken] = useState<string | null>(localStorage.getItem('userToken'));
+  const [username, setUsername] = useState<string | null>(localStorage.getItem('username'));
+
+  const handleLoginSuccess = (token: string, user: string) => {
+    localStorage.setItem('userToken', token);
+    localStorage.setItem('username', user);
+    setUserToken(token);
+    setUsername(user);
+    setBotMode('EXCHANGE_LIVE');
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem('userToken');
+    localStorage.removeItem('username');
+    setUserToken(null);
+    setUsername(null);
+    setExchangeStatus({
+      connected: false,
+      exchangeId: 'binance',
+      isTestnet: true,
+      balance: 0,
+      equity: 0,
+      dailyDrawdownPercent: 0,
+      circuitBreakerTriggered: false,
+    });
+    setBotActive(false);
+    setBotMode('MOCK_SIMULATOR');
+  };
+
   // --- Settings States ---
   const [stratSettings, setStratSettings] = useState<StrategySettings>({
     strategyType: 'TREND_FOLLOWING',
@@ -30,10 +61,10 @@ export default function App() {
     emaLongPeriod: 50,
     emaTrendPeriod: 200,
     rsiPeriod: 14,
-    rsiOverbought: 65,
-    rsiOversold: 30,
+    rsiOverbought: 75,
+    rsiOversold: 25,
     atrPeriod: 14,
-    adxThreshold: 25,
+    adxThreshold: 30,
     useMultiTimeframe: true,
   });
 
@@ -73,6 +104,8 @@ export default function App() {
     equity?: number;
     dailyDrawdownPercent?: number;
     circuitBreakerTriggered?: boolean;
+    maskedApiKey?: string;
+    maskedApiSecret?: string;
   }>({
     connected: false,
     exchangeId: 'binance',
@@ -81,6 +114,8 @@ export default function App() {
     equity: 0,
     dailyDrawdownPercent: 0,
     circuitBreakerTriggered: false,
+    maskedApiKey: '',
+    maskedApiSecret: '',
   });
   const [symbol, setSymbol] = useState('BTC/USDT, ETH/USDT, SOL/USDT');
   const [viewedSymbol, setViewedSymbol] = useState('BTC/USDT');
@@ -104,6 +139,7 @@ export default function App() {
   // Refs for tracking counts and ticking
   const tickCountRef = useRef(0);
   const simIntervalRef = useRef<any>(null);
+  const lastExitTimeRef = useRef<number | null>(null);
 
   // Add a log message helper
   const addLog = (text: string, type: LogMessage['type'] = 'info') => {
@@ -132,11 +168,17 @@ export default function App() {
 
   // Poll local CCXT Express server when EXCHANGE_LIVE mode is active
   useEffect(() => {
-    if (botMode !== 'EXCHANGE_LIVE') return;
+    if (botMode !== 'EXCHANGE_LIVE' || !userToken) return;
 
     const fetchStatus = async () => {
       try {
-        const res = await fetch(`/api/status?symbol=${encodeURIComponent(viewedSymbol)}`);
+        const res = await fetch(`/api/status?symbol=${encodeURIComponent(viewedSymbol)}`, {
+          headers: { 'Authorization': `Bearer ${userToken}` }
+        });
+        if (res.status === 401) {
+          handleLogout();
+          return;
+        }
         if (res.ok) {
           const data = await res.json();
           setExchangeStatus({
@@ -147,6 +189,8 @@ export default function App() {
             equity: data.equity,
             dailyDrawdownPercent: data.dailyDrawdownPercent,
             circuitBreakerTriggered: data.circuitBreakerTriggered,
+            maskedApiKey: data.maskedApiKey,
+            maskedApiSecret: data.maskedApiSecret,
           });
           setBotActive(data.botActive);
           setAllPositions(data.allPositions || []);
@@ -172,7 +216,13 @@ export default function App() {
 
     const fetchLogs = async () => {
       try {
-        const res = await fetch('/api/logs');
+        const res = await fetch('/api/logs', {
+          headers: { 'Authorization': `Bearer ${userToken}` }
+        });
+        if (res.status === 401) {
+          handleLogout();
+          return;
+        }
         if (res.ok) {
           const data = await res.json();
           if (data.logs) {
@@ -193,7 +243,7 @@ export default function App() {
     }, 2000);
 
     return () => clearInterval(interval);
-  }, [botMode, viewedSymbol]);
+  }, [botMode, viewedSymbol, userToken]);
 
   const handleConnectExchange = async (
     exchangeId: string,
@@ -204,9 +254,16 @@ export default function App() {
     try {
       const res = await fetch('/api/connect', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(userToken ? { 'Authorization': `Bearer ${userToken}` } : {})
+        },
         body: JSON.stringify({ exchangeId, apiKey, apiSecret, isTestnet }),
       });
+      if (res.status === 401) {
+        handleLogout();
+        return false;
+      }
       if (res.ok) {
         const data = await res.json();
         setExchangeStatus({
@@ -226,7 +283,14 @@ export default function App() {
 
   const handleDisconnectExchange = async () => {
     try {
-      const res = await fetch('/api/disconnect', { method: 'POST' });
+      const res = await fetch('/api/disconnect', {
+        method: 'POST',
+        headers: userToken ? { 'Authorization': `Bearer ${userToken}` } : {}
+      });
+      if (res.status === 401) {
+        handleLogout();
+        return;
+      }
       if (res.ok) {
         setExchangeStatus({
           connected: false,
@@ -250,7 +314,10 @@ export default function App() {
         const activeSymbolsList = symbol.split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
         const res = await fetch('/api/toggle-bot', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            ...(userToken ? { 'Authorization': `Bearer ${userToken}` } : {})
+          },
           body: JSON.stringify({
             active: newActiveState,
             settings: stratSettings,
@@ -259,6 +326,10 @@ export default function App() {
             activeSymbols: activeSymbolsList,
           }),
         });
+        if (res.status === 401) {
+          handleLogout();
+          return;
+        }
         if (res.ok) {
           setBotActive(newActiveState);
         }
@@ -430,6 +501,7 @@ export default function App() {
               : `🛑 STOP LOSS hit at $${exitPrice.toFixed(2)}. Loss locked: -$${Math.abs(finalPnl).toFixed(2)}.`;
             
             addLog(logMsg, exitReason === 'TP' || exitReason === 'TRAILING_STOP' ? 'success' : 'danger');
+            lastExitTimeRef.current = currentCandle.time;
 
             return null; // clear active position
           }
@@ -440,6 +512,10 @@ export default function App() {
 
         // 3. Evaluate entry rules (Only on closed candles to avoid repaint signals)
         if (isNewCandle && !activePosition) {
+          // Check 3-candle cooldown (15 minutes on 5m timeframe)
+          if (lastExitTimeRef.current && (currentCandle.time - lastExitTimeRef.current) < 3 * 5 * 60 * 1000) {
+            return calculatedCandles;
+          }
           const decision = evaluateStrategy(calculatedCandles, stratSettings);
           
           if (decision.signal) {
@@ -514,9 +590,16 @@ export default function App() {
       try {
         const res = await fetch('/api/close-position', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            ...(userToken ? { 'Authorization': `Bearer ${userToken}` } : {})
+          },
           body: JSON.stringify({ symbol: symbolToClose || viewedSymbol })
         });
+        if (res.status === 401) {
+          handleLogout();
+          return;
+        }
         if (res.ok) {
           addLog(`Manual market close order sent to exchange backend successfully for ${symbolToClose || viewedSymbol}.`, 'success');
         }
@@ -556,6 +639,7 @@ export default function App() {
 
     setClosedTrades((prevTrades) => [...prevTrades, closedPos]);
     setActivePosition(null);
+    lastExitTimeRef.current = Date.now();
     addLog(`⚠️ POSITION CLOSED MANUALLY at $${currentPrice.toFixed(2)}. PnL: ${finalPnl >= 0 ? '+' : ''}$${finalPnl.toFixed(2)}.`, 'warning');
   };
 
@@ -587,6 +671,10 @@ export default function App() {
   };
 
   const currentPrice = candles.length > 0 ? candles[candles.length - 1].close : 50000;
+
+  if (!userToken) {
+    return <AuthPage onLoginSuccess={handleLoginSuccess} />;
+  }
 
   return (
     <div className="app-container">
@@ -624,6 +712,27 @@ export default function App() {
             <span className={`status-dot ${botActive ? 'active' : ''}`}></span>
             <span>{botActive ? 'LIVE PAPER TRADING' : 'SIMULATION IDLE'}</span>
           </div>
+
+          {userToken && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: '12px', borderLeft: '1px solid var(--border-color)', paddingLeft: '20px', marginLeft: '12px' }}>
+              <span style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>User: <strong style={{ color: 'var(--text-primary)' }}>{username}</strong></span>
+              <button
+                onClick={handleLogout}
+                style={{
+                  background: 'rgba(239, 68, 68, 0.1)',
+                  color: 'var(--accent-red)',
+                  border: '1px solid rgba(239, 68, 68, 0.2)',
+                  borderRadius: 'var(--radius-sm)',
+                  padding: '4px 10px',
+                  fontSize: '11px',
+                  fontWeight: '600',
+                  cursor: 'pointer'
+                }}
+              >
+                Logout
+              </button>
+            </div>
+          )}
         </div>
       </header>
 

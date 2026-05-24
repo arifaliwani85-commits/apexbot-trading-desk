@@ -3,6 +3,21 @@ const cors = require('cors');
 const dotenv = require('dotenv');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
+
+let ccxt = null;
+function getCcxt() {
+  if (!ccxt) {
+    console.log('[SYSTEM] Loading CCXT exchange library on-demand...');
+    const start = Date.now();
+    ccxt = require('ccxt');
+    console.log(`[SYSTEM] Loaded CCXT exchange library in ${Date.now() - start}ms`);
+  }
+  return ccxt;
+}
+
+// Load environment variables
+dotenv.config();
 
 // Global Error Logger for Hostinger Diagnostics
 process.on('uncaughtException', (err) => {
@@ -26,84 +41,236 @@ process.on('unhandledRejection', (reason, promise) => {
   console.error(logMsg);
 });
 
-const ccxt = require('ccxt');
-
-// Load environment variables
-dotenv.config();
-
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3001;
 
-// --- In-Memory State ---
-let exchangeInstance = null;
-let connectionStatus = 'DISCONNECTED'; // DISCONNECTED, CONNECTED, ERROR
-let exchangeConfig = {
-  exchangeId: 'binance',
-  apiKey: '',
-  apiSecret: '',
-  isTestnet: true,
-};
+// --- Security & Hashing Helpers ---
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || process.env.SESSION_SECRET || 'a_very_secure_default_32_byte_key_123!';
 
-let botActive = false;
-let currentSymbol = 'BTC/USDT'; // Currently selected symbol for chart views
-let activeSymbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']; // basket of symbols to trade
-let activePositions = {}; // symbol -> position map
-let closedTrades = [];
-let botLogs = [];
-
-let lastTickPrices = {}; // symbol -> price map
-let candlesMap = {};     // symbol -> 15m candles list
-
-let dailyStartEquity = null;
-let lastCircuitBreakerCheckDate = '';
-let circuitBreakerTriggered = false;
-
-let stratSettings = {
-  strategyType: 'TREND_FOLLOWING',
-  emaShortPeriod: 20,
-  emaLongPeriod: 50,
-  emaTrendPeriod: 200,
-  rsiPeriod: 14,
-  rsiOverbought: 65,
-  rsiOversold: 30,
-  atrPeriod: 14,
-  adxThreshold: 25,
-  useMultiTimeframe: true,
-};
-
-let riskSettings = {
-  riskPercent: 1.0,
-  riskRewardRatio: 2.0,
-  atrMultiplier: 2.0,
-  trailingStopEnabled: true,
-  trailingStopTrigger: 1.2,
-  maxDailyDrawdown: 5.0,
-  leverage: 1,
-  maxConcurrentPositions: 3,
-  partialTakeProfitEnabled: true,
-};
-
-// Add server log message helper
-function addLog(text, type = 'info') {
-  const log = {
-    id: Math.random().toString(),
-    timestamp: Date.now(),
-    type,
-    text,
-  };
-  botLogs.push(log);
-  if (botLogs.length > 200) botLogs.shift();
-  console.log(`[${new Date().toISOString()}] [${type.toUpperCase()}] ${text}`);
+function getDerivedKey() {
+  return crypto.createHash('sha256').update(ENCRYPTION_KEY).digest();
 }
 
-// Initial System Log
-addLog('Local backend server starting...', 'info');
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.pbkdf2Sync(password, salt, 1000, 64, 'sha512').toString('hex');
+  return { salt, hash };
+}
 
-// --- Math & Indicator Helper Functions (CommonJS version) ---
+function verifyPassword(password, salt, hash) {
+  const verifyHash = crypto.pbkdf2Sync(password, salt, 1000, 64, 'sha512').toString('hex');
+  return hash === verifyHash;
+}
 
+function encryptText(text) {
+  const iv = crypto.randomBytes(12);
+  const key = getDerivedKey();
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  let encrypted = cipher.update(text, 'utf8', 'hex');
+  encrypted += cipher.final('hex');
+  const authTag = cipher.getAuthTag().toString('hex');
+  return `${iv.toString('hex')}:${authTag}:${encrypted}`;
+}
+
+function decryptText(encryptedText) {
+  try {
+    const parts = encryptedText.split(':');
+    if (parts.length !== 3) return '';
+    const iv = Buffer.from(parts[0], 'hex');
+    const authTag = Buffer.from(parts[1], 'hex');
+    const encrypted = parts[2];
+    const key = getDerivedKey();
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+    decipher.setAuthTag(authTag);
+    let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+    decrypted += decipher.final('utf8');
+    return decrypted;
+  } catch (e) {
+    console.error('Decryption failed:', e);
+    return '';
+  }
+}
+
+// --- JWT-like Pure JS Stateless Tokens ---
+function generateToken(payload) {
+  const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+  const body = Buffer.from(JSON.stringify({ ...payload, exp: Date.now() + 7 * 24 * 60 * 60 * 1000 })).toString('base64url');
+  const signature = crypto.createHmac('sha256', getDerivedKey()).update(`${header}.${body}`).digest('base64url');
+  return `${header}.${body}.${signature}`;
+}
+
+function verifyToken(token) {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    const [header, body, signature] = parts;
+    const expectedSignature = crypto.createHmac('sha256', getDerivedKey()).update(`${header}.${body}`).digest('base64url');
+    if (signature !== expectedSignature) return null;
+    const payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
+    if (Date.now() > payload.exp) return null;
+    return payload;
+  } catch (e) {
+    return null;
+  }
+}
+
+// --- Local File Database Setup ---
+const DB_DIR = path.join(__dirname, 'db', 'users');
+if (!fs.existsSync(DB_DIR)) {
+  fs.mkdirSync(DB_DIR, { recursive: true });
+}
+
+function getUserPath(username) {
+  const safeName = username.replace(/[^a-zA-Z0-9_-]/g, '');
+  return path.join(DB_DIR, `${safeName}.json`);
+}
+
+function saveUserProfile(profile) {
+  const userPath = getUserPath(profile.username);
+  fs.writeFileSync(userPath, JSON.stringify(profile, null, 2));
+}
+
+function loadUserProfile(username) {
+  const userPath = getUserPath(username);
+  if (!fs.existsSync(userPath)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(userPath, 'utf8'));
+  } catch (e) {
+    console.error(`Failed to parse user profile for ${username}`, e);
+    return null;
+  }
+}
+
+// --- In-Memory Multi-User Session Map ---
+const userSessions = {};
+
+function getOrCreateSession(username) {
+  if (userSessions[username]) {
+    return userSessions[username];
+  }
+
+  const profile = loadUserProfile(username);
+  if (!profile) return null;
+
+  const session = {
+    username: profile.username,
+    exchangeInstance: null,
+    connectionStatus: 'DISCONNECTED',
+    exchangeConfig: {
+      exchangeId: 'bybit',
+      apiKey: '',
+      apiSecret: '',
+      isTestnet: true,
+    },
+    botActive: profile.botActive || false,
+    currentSymbol: profile.currentSymbol || 'BTC/USDT',
+    activeSymbols: profile.activeSymbols || ['BTC/USDT', 'ETH/USDT', 'SOL/USDT'],
+    activePositions: {},
+    closedTrades: profile.closedTrades || [],
+    botLogs: [],
+    lastTickPrices: {},
+    candlesMap: {},
+    dailyStartEquity: null,
+    lastCircuitBreakerCheckDate: '',
+    circuitBreakerTriggered: false,
+    cooldowns: {}, // symbol -> timestamp of exit
+    stratSettings: profile.stratSettings || {
+      strategyType: 'TREND_FOLLOWING',
+      emaShortPeriod: 20,
+      emaLongPeriod: 50,
+      emaTrendPeriod: 200,
+      rsiPeriod: 14,
+      rsiOverbought: 75,
+      rsiOversold: 25,
+      atrPeriod: 14,
+      adxThreshold: 30,
+      useMultiTimeframe: true,
+    },
+    riskSettings: profile.riskSettings || {
+      riskPercent: 1.0,
+      riskRewardRatio: 2.0,
+      atrMultiplier: 2.0,
+      trailingStopEnabled: true,
+      trailingStopTrigger: 1.2,
+      maxDailyDrawdown: 5.0,
+      leverage: 1,
+      maxConcurrentPositions: 3,
+      partialTakeProfitEnabled: true,
+    },
+    addLog: function(text, type = 'info') {
+      const log = {
+        id: Math.random().toString(),
+        timestamp: Date.now(),
+        type,
+        text,
+      };
+      this.botLogs.push(log);
+      if (this.botLogs.length > 200) this.botLogs.shift();
+      console.log(`[${this.username}] [${type.toUpperCase()}] ${text}`);
+    }
+  };
+
+  // Auto-connect if encrypted keys exist
+  if (profile.encryptedExchangeConfig) {
+    try {
+      const decrypted = decryptText(profile.encryptedExchangeConfig);
+      if (decrypted) {
+        const creds = JSON.parse(decrypted);
+        session.exchangeConfig = creds;
+
+        const exchangeClass = getCcxt()[creds.exchangeId];
+        if (exchangeClass) {
+          session.exchangeInstance = new exchangeClass({
+            apiKey: creds.apiKey,
+            secret: creds.apiSecret,
+            enableRateLimit: true,
+          });
+          if (creds.isTestnet && session.exchangeInstance.setSandboxMode) {
+            session.exchangeInstance.setSandboxMode(true);
+          }
+          session.connectionStatus = 'CONNECTED';
+          session.addLog(`Auto-loaded exchange keys. Connected to ${creds.exchangeId.toUpperCase()} (${creds.isTestnet ? 'TESTNET' : 'MAINNET'}).`, 'success');
+        }
+      }
+    } catch (e) {
+      session.connectionStatus = 'ERROR';
+      session.addLog(`Auto-connection failed: ${e.message}`, 'danger');
+    }
+  }
+
+  userSessions[username] = session;
+  return session;
+}
+
+// Load active bots on start
+function initAllActiveSessions() {
+  try {
+    if (!fs.existsSync(DB_DIR)) return;
+    const files = fs.readdirSync(DB_DIR);
+    let loadedCount = 0;
+    for (const file of files) {
+      if (file.endsWith('.json')) {
+        const username = file.replace('.json', '');
+        const profile = loadUserProfile(username);
+        if (profile && profile.botActive) {
+          getOrCreateSession(username);
+          loadedCount++;
+        }
+      }
+    }
+    console.log(`[SYSTEM] Restored ${loadedCount} active user trading sessions.`);
+  } catch (err) {
+    console.error('Failed to auto-load active sessions:', err);
+  }
+}
+
+// Initial boot restoration
+setTimeout(initAllActiveSessions, 1000);
+
+// --- Math & Indicator Helper Functions ---
 function calculateEMA(prices, period) {
   const ema = [];
   if (prices.length === 0) return ema;
@@ -238,7 +405,6 @@ function calculateATR(candlesList, period = 14) {
   return atr;
 }
 
-// Average Directional Index (ADX) using Wilder's smoothing technique
 function calculateADX(candlesList, period = 14) {
   const adx = Array(candlesList.length).fill(NaN);
   if (candlesList.length <= period * 2) return adx;
@@ -314,7 +480,6 @@ function calculateADX(candlesList, period = 14) {
   return adx;
 }
 
-// Volume Weighted Average Price (VWAP) with daily reset
 function calculateVWAP(candlesList) {
   const vwap = [];
   let cumVolume = 0;
@@ -343,7 +508,7 @@ function calculateVWAP(candlesList) {
   return vwap;
 }
 
-function computeIndicators(candlesList) {
+function computeIndicators(candlesList, stratSettings) {
   const closes = candlesList.map((c) => c.close);
   const emaShort = calculateEMA(closes, stratSettings.emaShortPeriod);
   const emaLong = calculateEMA(closes, stratSettings.emaLongPeriod);
@@ -370,7 +535,7 @@ function computeIndicators(candlesList) {
 }
 
 // Evaluate Strategy Entry Signals
-function evaluateStrategyRules(candlesList) {
+function evaluateStrategyRules(candlesList, stratSettings) {
   const len = candlesList.length;
   if (len < 5) return { signal: null };
 
@@ -378,21 +543,30 @@ function evaluateStrategyRules(candlesList) {
   const previous = candlesList[len - 2];
 
   if (stratSettings.strategyType === 'TREND_FOLLOWING') {
-    const { ema20, ema50, ema200, rsi } = current;
+    const { ema20, ema50, ema200, rsi, adx } = current;
     const { ema20: emaShortPrev, ema50: emaLongPrev } = previous;
     
-    if (!ema20 || !ema50 || !ema200 || !emaShortPrev || !emaLongPrev || !rsi) return { signal: null };
+    if (!ema20 || !ema50 || !ema200 || !emaShortPrev || !emaLongPrev || !rsi || !adx) return { signal: null };
+
+    // Enforce stricter ADX check
+    if (adx < stratSettings.adxThreshold) return { signal: null };
 
     // Golden Cross
     if (emaShortPrev <= emaLongPrev && ema20 > ema50) {
       if (current.close > ema200 && rsi < stratSettings.rsiOverbought) {
-        return { signal: 'BUY', reason: 'EMA Golden Cross with RSI confirmation in an uptrend' };
+        // Strict VWAP limit - close or below fair value
+        if (current.vwap && current.close <= current.vwap * 1.002) {
+          return { signal: 'BUY', reason: `EMA Golden Cross with RSI & VWAP entry confirmation (ADX: ${adx.toFixed(1)} > ${stratSettings.adxThreshold})` };
+        }
       }
     }
     // Death Cross
     if (emaShortPrev >= emaLongPrev && ema20 < ema50) {
       if (current.close < ema200 && rsi > stratSettings.rsiOversold) {
-        return { signal: 'SELL', reason: 'EMA Death Cross with RSI confirmation in a downtrend' };
+        // Strict VWAP limit - close or above fair value
+        if (current.vwap && current.close >= current.vwap * 0.998) {
+          return { signal: 'SELL', reason: `EMA Death Cross with RSI & VWAP entry confirmation (ADX: ${adx.toFixed(1)} > ${stratSettings.adxThreshold})` };
+        }
       }
     }
   } else if (stratSettings.strategyType === 'MEAN_REVERSION') {
@@ -401,11 +575,16 @@ function evaluateStrategyRules(candlesList) {
     
     if (!bbLower || !bbUpper || !bbLowerPrev || !bbUpperPrev || !rsi) return { signal: null };
 
+    // Enforce 25/75 RSI boundaries and VWAP constraints
     if ((current.close <= bbLower || previous.close <= bbLowerPrev) && rsi <= stratSettings.rsiOversold) {
-      return { signal: 'BUY', reason: 'Price rejected Lower BB with RSI oversold' };
+      if (current.vwap && current.close <= current.vwap) {
+        return { signal: 'BUY', reason: `Mean Reversion Buy: BB rejection & RSI oversold (${rsi.toFixed(1)} <= ${stratSettings.rsiOversold}) below VWAP` };
+      }
     }
     if ((current.close >= bbUpper || previous.close >= bbUpperPrev) && rsi >= stratSettings.rsiOverbought) {
-      return { signal: 'SELL', reason: 'Price rejected Upper BB with RSI overbought' };
+      if (current.vwap && current.close >= current.vwap) {
+        return { signal: 'SELL', reason: `Mean Reversion Sell: BB rejection & RSI overbought (${rsi.toFixed(1)} >= ${stratSettings.rsiOverbought}) above VWAP` };
+      }
     }
   } else if (stratSettings.strategyType === 'MOMENTUM_BREAKOUT') {
     const lookback = 20;
@@ -422,72 +601,151 @@ function evaluateStrategyRules(candlesList) {
     }
     const avgVol = totalVol / lookback;
     
-    const { atr } = current;
+    const { atr, vwap } = current;
     const { atr: atrPrev } = previous;
     if (!atr || !atrPrev) return { signal: null };
 
     if (current.close > highestHigh && current.volume > avgVol * 1.3 && atr > atrPrev) {
-      return { signal: 'BUY', reason: 'Price broke above 20-period high with volume expansion' };
+      if (vwap && current.close > vwap) {
+        return { signal: 'BUY', reason: 'High breakout with volume & ATR expansion above VWAP' };
+      }
     }
     if (current.close < lowestLow && current.volume > avgVol * 1.3 && atr > atrPrev) {
-      return { signal: 'SELL', reason: 'Price broke below 20-period low with volume expansion' };
+      if (vwap && current.close < vwap) {
+        return { signal: 'SELL', reason: 'Low breakout with volume & ATR expansion below VWAP' };
+      }
     }
   }
 
   return { signal: null };
 }
 
-// --- Initialize Saved Connection on Startup ---
-try {
-  const envPath = path.join(__dirname, '.env');
-  if (fs.existsSync(envPath)) {
-    dotenv.config({ path: envPath });
-  } else {
-    dotenv.config();
+// --- Authentication Middleware ---
+function requireAuth(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) {
+    return res.status(401).json({ success: false, error: 'Authorization header missing.' });
   }
 
-  const apiKey = process.env.EXCHANGE_API_KEY || process.env.BYBIT_API_KEY;
-  const apiSecret = process.env.EXCHANGE_API_SECRET || process.env.BYBIT_API_SECRET;
-  const exchangeId = process.env.EXCHANGE_ID || (process.env.BYBIT_API_KEY ? 'bybit' : 'binance');
-  const isTestnet = process.env.EXCHANGE_IS_TESTNET !== 'false' && process.env.BYBIT_IS_TESTNET !== 'false';
-
-  if (apiKey && apiSecret) {
-    exchangeConfig = {
-      exchangeId,
-      apiKey,
-      apiSecret,
-      isTestnet,
-    };
-    
-    const config = {
-      apiKey: exchangeConfig.apiKey,
-      secret: exchangeConfig.apiSecret,
-      enableRateLimit: true,
-    };
-
-    const exchangeClass = ccxt[exchangeConfig.exchangeId];
-    if (exchangeClass) {
-      exchangeInstance = new exchangeClass(config);
-      if (exchangeConfig.isTestnet && exchangeInstance.setSandboxMode) {
-        exchangeInstance.setSandboxMode(true);
-      }
-      connectionStatus = 'CONNECTED';
-      addLog(`Auto-loaded credentials from environment. Connected to ${exchangeConfig.exchangeId.toUpperCase()} (${exchangeConfig.isTestnet ? 'TESTNET' : 'MAINNET'}).`, 'success');
-    }
+  const token = authHeader.replace('Bearer ', '');
+  const payload = verifyToken(token);
+  if (!payload || !payload.username) {
+    return res.status(401).json({ success: false, error: 'Invalid or expired session token.' });
   }
-} catch (e) {
-  console.error('Error auto-loading API keys:', e);
+
+  const session = getOrCreateSession(payload.username);
+  if (!session) {
+    return res.status(401).json({ success: false, error: 'User session not found.' });
+  }
+
+  req.userSession = session;
+  next();
 }
 
-// --- Express Route Handlers ---
+// --- Auth Routes ---
 
-// Route to connect to Exchange
-app.post('/api/connect', async (req, res) => {
+app.post('/api/auth/register', (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) {
+    return res.status(400).json({ success: false, error: 'Username and password are required.' });
+  }
+
+  const sanitized = username.replace(/[^a-zA-Z0-9_-]/g, '');
+  if (sanitized !== username || username.length < 3) {
+    return res.status(400).json({ success: false, error: 'Username must be at least 3 characters and contain only letters, numbers, hyphens, and underscores.' });
+  }
+
+  const userPath = getUserPath(username);
+  if (fs.existsSync(userPath)) {
+    return res.status(400).json({ success: false, error: 'Username is already taken.' });
+  }
+
+  const { salt, hash } = hashPassword(password);
+
+  const newProfile = {
+    username,
+    salt,
+    hashedPassword: hash,
+    encryptedExchangeConfig: '',
+    botActive: false,
+    currentSymbol: 'BTC/USDT',
+    activeSymbols: ['BTC/USDT', 'ETH/USDT', 'SOL/USDT'],
+    closedTrades: [],
+    stratSettings: {
+      strategyType: 'TREND_FOLLOWING',
+      emaShortPeriod: 20,
+      emaLongPeriod: 50,
+      emaTrendPeriod: 200,
+      rsiPeriod: 14,
+      rsiOverbought: 75,
+      rsiOversold: 25,
+      atrPeriod: 14,
+      adxThreshold: 30,
+      useMultiTimeframe: true,
+    },
+    riskSettings: {
+      riskPercent: 1.0,
+      riskRewardRatio: 2.0,
+      atrMultiplier: 2.0,
+      trailingStopEnabled: true,
+      trailingStopTrigger: 1.2,
+      maxDailyDrawdown: 5.0,
+      leverage: 1,
+      maxConcurrentPositions: 3,
+      partialTakeProfitEnabled: true,
+    }
+  };
+
+  saveUserProfile(newProfile);
+  console.log(`[AUTH] Registered new user: ${username}`);
+  res.json({ success: true, message: 'Registration successful! You can now log in.' });
+});
+
+app.post('/api/auth/login', (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) {
+    return res.status(400).json({ success: false, error: 'Username and password are required.' });
+  }
+
+  const profile = loadUserProfile(username);
+  if (!profile) {
+    return res.status(400).json({ success: false, error: 'Invalid username or password.' });
+  }
+
+  const isValid = verifyPassword(password, profile.salt, profile.hashedPassword);
+  if (!isValid) {
+    return res.status(400).json({ success: false, error: 'Invalid username or password.' });
+  }
+
+  // Create session JWT-like token
+  const token = generateToken({ username: profile.username });
+
+  // Instantiate runtime session in memory
+  getOrCreateSession(username);
+
+  console.log(`[AUTH] User logged in: ${username}`);
+  res.json({
+    success: true,
+    token,
+    username: profile.username,
+  });
+});
+
+app.post('/api/auth/logout', (req, res) => {
+  // Stateless tokens don't strictly require server-side destruction,
+  // but we can log the action or clean up memory if we want.
+  res.json({ success: true });
+});
+
+// --- Scoped Express Route Handlers ---
+
+app.post('/api/connect', requireAuth, async (req, res) => {
+  const session = req.userSession;
   const { exchangeId, apiKey, apiSecret, isTestnet } = req.body;
-  addLog(`Attempting to connect to ${exchangeId.toUpperCase()}...`, 'info');
+  session.addLog(`Attempting to connect to ${exchangeId.toUpperCase()}...`, 'info');
 
   try {
-    const exchangeClass = ccxt[exchangeId];
+    const exchangeClass = getCcxt()[exchangeId];
     if (!exchangeClass) {
       throw new Error(`Exchange ${exchangeId} is not supported by CCXT.`);
     }
@@ -505,37 +763,37 @@ app.post('/api/connect', async (req, res) => {
     // Fetch balance to validate the API key works
     const balanceData = await testExchange.fetchBalance();
     
-    // Success: Update state
-    exchangeInstance = testExchange;
-    connectionStatus = 'CONNECTED';
-    exchangeConfig = { exchangeId, apiKey, apiSecret, isTestnet };
-    circuitBreakerTriggered = false; // Reset circuit breaker on successful connection
+    // Success: Update session state
+    session.exchangeInstance = testExchange;
+    session.connectionStatus = 'CONNECTED';
+    session.exchangeConfig = { exchangeId, apiKey, apiSecret, isTestnet };
+    session.circuitBreakerTriggered = false; // Reset circuit breaker on successful connection
 
-    // Write securely to local .env file
-    const envContent = `EXCHANGE_ID=${exchangeId}
-EXCHANGE_API_KEY=${apiKey}
-EXCHANGE_API_SECRET=${apiSecret}
-EXCHANGE_IS_TESTNET=${isTestnet}`;
-    
-    fs.writeFileSync(path.join(__dirname, '.env'), envContent);
+    // Write securely to local db file
+    const profile = loadUserProfile(session.username);
+    if (profile) {
+      const credsString = JSON.stringify({ exchangeId, apiKey, apiSecret, isTestnet });
+      profile.encryptedExchangeConfig = encryptText(credsString);
+      saveUserProfile(profile);
+    }
 
-    addLog(`Connected successfully to ${exchangeId.toUpperCase()}! Balance fetched.`, 'success');
+    session.addLog(`Connected successfully to ${exchangeId.toUpperCase()}! Balance fetched.`, 'success');
     
     res.json({
       success: true,
-      status: connectionStatus,
+      status: session.connectionStatus,
       balance: balanceData.total.USDT || balanceData.total.BUSD || 0,
     });
   } catch (err) {
-    connectionStatus = 'ERROR';
+    session.connectionStatus = 'ERROR';
     let msg = err.message || '';
     let friendlyError = msg;
     
     if (exchangeId === 'bybit') {
       if (msg.includes('10003') || msg.toLowerCase().includes('api key is invalid')) {
-        friendlyError = `Bybit API Key Invalid (Error 10003). Check that you are connecting to the correct environment (Testnet requires "Use Testnet Sandbox" checked, Mainnet requires it unchecked) and verify your key characters.`;
+        friendlyError = `Bybit API Key Invalid (Error 10003). Check that you are connecting to the correct environment (Testnet requires "Use Testnet Sandbox" checked) and verify your key characters.`;
       } else if (msg.includes('10005') || msg.toLowerCase().includes('permission')) {
-        friendlyError = `Bybit Permission Error. Ensure your API Key has "Trade" or "Unified Account" permissions enabled in your Bybit API settings.`;
+        friendlyError = `Bybit Permission Error. Ensure your API Key has "Trade" permissions enabled in your Bybit settings.`;
       }
     } else if (exchangeId === 'binance') {
       if (msg.toLowerCase().includes('api key') || msg.toLowerCase().includes('invalid')) {
@@ -543,163 +801,179 @@ EXCHANGE_IS_TESTNET=${isTestnet}`;
       }
     }
     
-    addLog(`Connection failed: ${friendlyError}`, 'danger');
+    session.addLog(`Connection failed: ${friendlyError}`, 'danger');
     res.status(400).json({ success: false, error: friendlyError });
   }
 });
 
-// Route to disconnect from exchange and clear keys
-app.post('/api/disconnect', (req, res) => {
-  exchangeInstance = null;
-  connectionStatus = 'DISCONNECTED';
-  exchangeConfig = { exchangeId: 'binance', apiKey: '', apiSecret: '', isTestnet: true };
-  botActive = false;
+app.post('/api/disconnect', requireAuth, (req, res) => {
+  const session = req.userSession;
+  session.exchangeInstance = null;
+  session.connectionStatus = 'DISCONNECTED';
+  session.exchangeConfig = { exchangeId: 'binance', apiKey: '', apiSecret: '', isTestnet: true };
+  session.botActive = false;
   
-  try {
-    const envPath = path.join(__dirname, '.env');
-    if (fs.existsSync(envPath)) {
-      fs.unlinkSync(envPath); // Deletes .env file securely
-    }
-  } catch (e) {
-    console.error('Error clearing .env credentials:', e);
+  const profile = loadUserProfile(session.username);
+  if (profile) {
+    profile.encryptedExchangeConfig = '';
+    profile.botActive = false;
+    saveUserProfile(profile);
   }
 
-  addLog('Disconnected from exchange. API credentials cleared.', 'warning');
+  session.addLog('Disconnected from exchange. API credentials cleared.', 'warning');
   res.json({ success: true });
 });
 
-// Route to get Bot status & balance
-app.get('/api/status', async (req, res) => {
+app.get('/api/status', requireAuth, async (req, res) => {
+  const session = req.userSession;
   const clientSymbol = req.query.symbol;
-  if (clientSymbol && activeSymbols.includes(clientSymbol)) {
-    currentSymbol = clientSymbol;
+  if (clientSymbol && session.activeSymbols.includes(clientSymbol)) {
+    session.currentSymbol = clientSymbol;
+    
+    const profile = loadUserProfile(session.username);
+    if (profile && profile.currentSymbol !== clientSymbol) {
+      profile.currentSymbol = clientSymbol;
+      saveUserProfile(profile);
+    }
   }
 
   let exchangeBalance = 0;
   
-  if (exchangeInstance && connectionStatus === 'CONNECTED') {
+  if (session.exchangeInstance && session.connectionStatus === 'CONNECTED') {
     try {
-      const balanceData = await exchangeInstance.fetchBalance();
+      const balanceData = await session.exchangeInstance.fetchBalance();
       exchangeBalance = balanceData.total.USDT || balanceData.total.BUSD || 0;
     } catch (e) {
-      addLog(`Failed to fetch live balance: ${e.message}`, 'warning');
+      session.addLog(`Failed to fetch live balance: ${e.message}`, 'warning');
     }
   }
 
   // Calculate daily drawdown based on equity vs start balance
   let netUnrealizedPnL = 0;
-  Object.values(activePositions).forEach((pos) => {
+  Object.values(session.activePositions).forEach((pos) => {
     if (pos) {
-      const price = lastTickPrices[pos.symbol] || pos.entryPrice;
+      const price = session.lastTickPrices[pos.symbol] || pos.entryPrice;
       const diff = pos.type === 'LONG' ? price - pos.entryPrice : pos.entryPrice - price;
       netUnrealizedPnL += diff * pos.size * pos.leverage;
     }
   });
 
   const currentEquity = exchangeBalance + netUnrealizedPnL;
-  if (dailyStartEquity === null && exchangeBalance > 0) {
-    dailyStartEquity = exchangeBalance;
+  if (session.dailyStartEquity === null && exchangeBalance > 0) {
+    session.dailyStartEquity = exchangeBalance;
   }
 
   let dailyDrawdownPercent = 0;
-  if (dailyStartEquity > 0) {
-    const pnl = currentEquity - dailyStartEquity;
+  if (session.dailyStartEquity > 0) {
+    const pnl = currentEquity - session.dailyStartEquity;
     if (pnl < 0) {
-      dailyDrawdownPercent = (Math.abs(pnl) / dailyStartEquity) * 100;
+      dailyDrawdownPercent = (Math.abs(pnl) / session.dailyStartEquity) * 100;
     }
   }
 
   res.json({
-    connected: connectionStatus === 'CONNECTED',
-    exchangeId: exchangeConfig.exchangeId,
-    isTestnet: exchangeConfig.isTestnet,
+    connected: session.connectionStatus === 'CONNECTED',
+    exchangeId: session.exchangeConfig.exchangeId,
+    isTestnet: session.exchangeConfig.isTestnet,
     balance: exchangeBalance,
     equity: currentEquity,
-    botActive,
-    symbol: currentSymbol,
-    activeSymbols,
-    activePosition: activePositions[currentSymbol] || null,
-    allPositions: Object.values(activePositions).filter(Boolean),
-    candles: (candlesMap[currentSymbol] || []).slice(-100),
+    botActive: session.botActive,
+    symbol: session.currentSymbol,
+    activeSymbols: session.activeSymbols,
+    activePosition: session.activePositions[session.currentSymbol] || null,
+    allPositions: Object.values(session.activePositions).filter(Boolean),
+    candles: (session.candlesMap[session.currentSymbol] || []).slice(-100),
     dailyDrawdownPercent,
-    dailyStartEquity,
-    circuitBreakerTriggered,
+    dailyStartEquity: session.dailyStartEquity,
+    circuitBreakerTriggered: session.circuitBreakerTriggered,
+    // Add masked configuration credentials
+    maskedApiKey: session.exchangeConfig.apiKey ? `${session.exchangeConfig.apiKey.slice(0, 4)}...${session.exchangeConfig.apiKey.slice(-4)}` : '',
+    maskedApiSecret: session.exchangeConfig.apiSecret ? '********************************' : '',
   });
 });
 
-// Route to get bot logs
-app.get('/api/logs', (req, res) => {
-  res.json({ logs: botLogs });
+app.get('/api/logs', requireAuth, (req, res) => {
+  res.json({ logs: req.userSession.botLogs });
 });
 
-// Route to close position manually on the exchange
-app.post('/api/close-position', async (req, res) => {
-  const targetSym = req.body.symbol || currentSymbol;
-  const pos = activePositions[targetSym];
+app.post('/api/close-position', requireAuth, async (req, res) => {
+  const session = req.userSession;
+  const targetSym = req.body.symbol || session.currentSymbol;
+  const pos = session.activePositions[targetSym];
   if (!pos) {
     return res.status(400).json({ success: false, error: `No active position open for ${targetSym}.` });
   }
 
-  addLog(`Request received to manually market close position for ${targetSym}...`, 'warning');
+  session.addLog(`Request received to manually market close position for ${targetSym}...`, 'warning');
   try {
-    await executeCloseOrder(targetSym, 'MANUAL');
+    await executeCloseOrder(session, targetSym, 'MANUAL');
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// Route to toggle Live Trading loop
-app.post('/api/toggle-bot', (req, res) => {
+app.post('/api/toggle-bot', requireAuth, (req, res) => {
+  const session = req.userSession;
   const { active, settings, risk, symbol, activeSymbols: clientActiveSymbols } = req.body;
   
-  botActive = active;
-  if (settings) stratSettings = settings;
-  if (risk) riskSettings = risk;
-  if (symbol) currentSymbol = symbol;
+  session.botActive = active;
+  if (settings) session.stratSettings = settings;
+  if (risk) session.riskSettings = risk;
+  if (symbol) session.currentSymbol = symbol;
   if (clientActiveSymbols && Array.isArray(clientActiveSymbols)) {
-    activeSymbols = clientActiveSymbols;
+    session.activeSymbols = clientActiveSymbols;
   }
 
-  if (botActive) {
-    if (circuitBreakerTriggered) {
-      circuitBreakerTriggered = false; // Reset circuit breaker
-      dailyStartEquity = null;
-      addLog('Daily Drawdown Circuit Breaker reset manually by starting the bot.', 'info');
+  if (session.botActive) {
+    if (session.circuitBreakerTriggered) {
+      session.circuitBreakerTriggered = false; // Reset circuit breaker
+      session.dailyStartEquity = null;
+      session.addLog('Daily Drawdown Circuit Breaker reset manually by starting the bot.', 'info');
     }
-    addLog(`Automated Live Trading loop ACTIVATED for: ${activeSymbols.join(', ')}.`, 'warning');
-    if (!exchangeInstance) {
-      addLog('Liveness Warning: Exchange client is not connected! Trading is paused.', 'danger');
+    session.addLog(`Automated Live Trading loop ACTIVATED for: ${session.activeSymbols.join(', ')}.`, 'warning');
+    if (!session.exchangeInstance) {
+      session.addLog('Liveness Warning: Exchange client is not connected! Trading is paused.', 'danger');
     }
   } else {
-    addLog('Automated Live Trading loop DEACTIVATED.', 'warning');
+    session.addLog('Automated Live Trading loop DEACTIVATED.', 'warning');
   }
 
-  res.json({ success: true, botActive });
+  // Save changes to profile db
+  const profile = loadUserProfile(session.username);
+  if (profile) {
+    profile.botActive = session.botActive;
+    profile.currentSymbol = session.currentSymbol;
+    profile.activeSymbols = session.activeSymbols;
+    profile.stratSettings = session.stratSettings;
+    profile.riskSettings = session.riskSettings;
+    saveUserProfile(profile);
+  }
+
+  res.json({ success: true, botActive: session.botActive });
 });
 
 // --- HELPER EXECUTION ROUTINES ---
-
-async function executeCloseOrder(symbol, reason, customSize = null) {
-  const pos = activePositions[symbol];
+async function executeCloseOrder(session, symbol, reason, customSize = null) {
+  const pos = session.activePositions[symbol];
   if (!pos) return;
 
   const closeSide = pos.type === 'LONG' ? 'sell' : 'buy';
   const sizeToClose = customSize !== null ? customSize : pos.size;
-  const tickerPrice = lastTickPrices[symbol] || pos.entryPrice;
+  const tickerPrice = session.lastTickPrices[symbol] || pos.entryPrice;
 
-  addLog(`Sending Close Order (${closeSide.toUpperCase()}) on Exchange for ${sizeToClose.toFixed(4)} ${symbol.split('/')[0]}...`, 'info');
+  session.addLog(`Sending Close Order (${closeSide.toUpperCase()}) on Exchange for ${sizeToClose.toFixed(4)} ${symbol.split('/')[0]}...`, 'info');
 
   try {
     let fillPrice = tickerPrice;
 
-    if (exchangeInstance) {
+    if (session.exchangeInstance) {
       // Place real market order on exchange to close
-      const order = await exchangeInstance.createMarketOrder(symbol, closeSide, sizeToClose);
+      const order = await session.exchangeInstance.createMarketOrder(symbol, closeSide, sizeToClose);
       fillPrice = order.price || order.average || tickerPrice;
-      addLog(`Exchange Fill success for ${symbol}. Closed size ${sizeToClose.toFixed(4)} at average price $${fillPrice}.`, 'success');
+      session.addLog(`Exchange Fill success for ${symbol}. Closed size ${sizeToClose.toFixed(4)} at average price $${fillPrice}.`, 'success');
     } else {
-      addLog(`Simulation Note: Exchange client disconnected. Filled closing order locally at ticker price.`, 'warning');
+      session.addLog(`Simulation Note: Exchange client disconnected. Filled closing order locally at ticker price.`, 'warning');
     }
 
     const pnl = pos.type === 'LONG'
@@ -710,7 +984,7 @@ async function executeCloseOrder(symbol, reason, customSize = null) {
       // Partial Scale Out
       pos.size -= customSize;
       pos.halfClosed = true;
-      addLog(`Partial scale-out completed. Secured $${pnl.toFixed(2)} profit.`, 'success');
+      session.addLog(`Partial scale-out completed. Secured $${pnl.toFixed(2)} profit.`, 'success');
     } else {
       // Full Close
       const closedPos = {
@@ -724,290 +998,315 @@ async function executeCloseOrder(symbol, reason, customSize = null) {
         pnlPercent: (pnl / (pos.entryPrice * sizeToClose)) * 100,
       };
 
-      closedTrades.push(closedPos);
-      activePositions[symbol] = null;
+      session.closedTrades.push(closedPos);
+      session.activePositions[symbol] = null;
+
+      // Track the exit timestamp for the 3-candle cooldown
+      session.cooldowns[symbol] = Date.now();
+
+      // Save closedTrades to profile db
+      const profile = loadUserProfile(session.username);
+      if (profile) {
+        profile.closedTrades = session.closedTrades;
+        saveUserProfile(profile);
+      }
 
       const summaryMsg = pnl >= 0
         ? `📈 Trade Closed [${reason}] for ${symbol}: Profit: +$${pnl.toFixed(2)} (${closedPos.pnlPercent.toFixed(2)}%)`
         : `📉 Trade Closed [${reason}] for ${symbol}: Loss: -$${Math.abs(pnl).toFixed(2)} (${closedPos.pnlPercent.toFixed(2)}%)`;
 
-      addLog(summaryMsg, pnl >= 0 ? 'success' : 'danger');
+      session.addLog(summaryMsg, pnl >= 0 ? 'success' : 'danger');
     }
   } catch (err) {
-    addLog(`Failed to close position on exchange for ${symbol}: ${err.message}`, 'danger');
+    session.addLog(`Failed to close position on exchange for ${symbol}: ${err.message}`, 'danger');
     throw err;
   }
 }
 
-// Sleep helper
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// --- Background Execution Loop (Polling Exchange) ---
+// --- Background Execution Loop (Polling Exchange per User Session) ---
 setInterval(async () => {
-  if (!exchangeInstance || connectionStatus !== 'CONNECTED') return;
+  const activeUsernames = Object.keys(userSessions);
+  for (const username of activeUsernames) {
+    const session = userSessions[username];
+    if (!session || !session.exchangeInstance || session.connectionStatus !== 'CONNECTED') continue;
 
-  try {
-    // 1. UTC Midnight circuit breaker reset check
-    const now = new Date();
-    const todayStr = `${now.getUTCFullYear()}-${now.getUTCMonth()}-${now.getUTCDate()}`;
+    try {
+      // 1. UTC Midnight circuit breaker reset check
+      const now = new Date();
+      const todayStr = `${now.getUTCFullYear()}-${now.getUTCMonth()}-${now.getUTCDate()}`;
 
-    const balanceData = await exchangeInstance.fetchBalance();
-    const exchangeBalance = balanceData.total.USDT || balanceData.total.BUSD || 0;
+      const balanceData = await session.exchangeInstance.fetchBalance();
+      const exchangeBalance = balanceData.total.USDT || balanceData.total.BUSD || 0;
 
-    if (lastCircuitBreakerCheckDate === '' || todayStr !== lastCircuitBreakerCheckDate) {
-      dailyStartEquity = exchangeBalance;
-      lastCircuitBreakerCheckDate = todayStr;
-      circuitBreakerTriggered = false;
-      addLog(`UTC Midnight Reset. Active equity balance: $${dailyStartEquity.toFixed(2)} USDT.`, 'info');
-    }
-
-    // 2. Compute current drawdown
-    let netUnrealizedPnL = 0;
-    Object.values(activePositions).forEach((pos) => {
-      if (pos) {
-        const price = lastTickPrices[pos.symbol] || pos.entryPrice;
-        const diff = pos.type === 'LONG' ? price - pos.entryPrice : pos.entryPrice - price;
-        netUnrealizedPnL += diff * pos.size * pos.leverage;
+      if (session.lastCircuitBreakerCheckDate === '' || todayStr !== session.lastCircuitBreakerCheckDate) {
+        session.dailyStartEquity = exchangeBalance;
+        session.lastCircuitBreakerCheckDate = todayStr;
+        session.circuitBreakerTriggered = false;
+        session.addLog(`UTC Midnight Reset. Active equity balance: $${session.dailyStartEquity.toFixed(2)} USDT.`, 'info');
       }
-    });
 
-    const currentEquity = exchangeBalance + netUnrealizedPnL;
-    let drawdownPercent = 0;
-    if (dailyStartEquity && dailyStartEquity > 0) {
-      const pnl = currentEquity - dailyStartEquity;
-      if (pnl < 0) {
-        drawdownPercent = (Math.abs(pnl) / dailyStartEquity) * 100;
-      }
-    }
-
-    // Circuit Breaker activation
-    if (drawdownPercent >= riskSettings.maxDailyDrawdown && !circuitBreakerTriggered) {
-      circuitBreakerTriggered = true;
-      botActive = false;
-      addLog(`[CRITICAL] Daily Max Drawdown limit (${riskSettings.maxDailyDrawdown}%) hit! (Current: -${drawdownPercent.toFixed(2)}%). Triggering Emergency Circuit Breaker.`, 'danger');
-
-      // Close all active positions
-      for (const sym of activeSymbols) {
-        if (activePositions[sym]) {
-          addLog(`Circuit Breaker: Market closing position for ${sym}...`, 'warning');
-          await executeCloseOrder(sym, 'DRAWDOWN');
-        }
-      }
-      return;
-    }
-
-    if (circuitBreakerTriggered || !botActive) return;
-
-    // 3. Process portfolio symbols sequentially (respect rate limits)
-    for (const symbol of activeSymbols) {
-      try {
-        const timeframe = '15m';
-        const ohlcv = await exchangeInstance.fetchOHLCV(symbol, timeframe, undefined, 100);
-
-        const fetchedCandles = ohlcv.map((c) => ({
-          time: c[0],
-          open: c[1],
-          high: c[2],
-          low: c[3],
-          close: c[4],
-          volume: c[5],
-        }));
-
-        const calculatedCandles = computeIndicators(fetchedCandles);
-        candlesMap[symbol] = calculatedCandles;
-        const latestCandle = calculatedCandles[calculatedCandles.length - 1];
-        const tickerPrice = latestCandle.close;
-        lastTickPrices[symbol] = tickerPrice;
-
-        // If this is the chart symbol, make it available globally
-        if (symbol === currentSymbol) {
-          candles = calculatedCandles;
-        }
-
-        // Check active position updates
-        const pos = activePositions[symbol];
+      // 2. Compute current drawdown
+      let netUnrealizedPnL = 0;
+      Object.values(session.activePositions).forEach((pos) => {
         if (pos) {
-          // Update peak/valley
-          if (pos.type === 'LONG') {
-            pos.maxObservedPrice = Math.max(pos.maxObservedPrice || pos.entryPrice, tickerPrice);
-          } else {
-            pos.minObservedPrice = Math.min(pos.minObservedPrice || pos.entryPrice, tickerPrice);
-          }
+          const price = session.lastTickPrices[pos.symbol] || pos.entryPrice;
+          const diff = pos.type === 'LONG' ? price - pos.entryPrice : pos.entryPrice - price;
+          netUnrealizedPnL += diff * pos.size * pos.leverage;
+        }
+      });
 
-          // Partial scale out check
-          if (riskSettings.partialTakeProfitEnabled && !pos.halfClosed) {
-            let target1Hit = false;
-            if (pos.type === 'LONG' && tickerPrice >= pos.target1Price) {
-              target1Hit = true;
-            } else if (pos.type === 'SHORT' && tickerPrice <= pos.target1Price) {
-              target1Hit = true;
+      const currentEquity = exchangeBalance + netUnrealizedPnL;
+      let drawdownPercent = 0;
+      if (session.dailyStartEquity && session.dailyStartEquity > 0) {
+        const pnl = currentEquity - session.dailyStartEquity;
+        if (pnl < 0) {
+          drawdownPercent = (Math.abs(pnl) / session.dailyStartEquity) * 100;
+        }
+      }
+
+      // Circuit Breaker activation
+      if (drawdownPercent >= session.riskSettings.maxDailyDrawdown && !session.circuitBreakerTriggered) {
+        session.circuitBreakerTriggered = true;
+        session.botActive = false;
+        session.addLog(`[CRITICAL] Daily Max Drawdown limit (${session.riskSettings.maxDailyDrawdown}%) hit! (Current: -${drawdownPercent.toFixed(2)}%). Triggering Emergency Circuit Breaker.`, 'danger');
+
+        // Save status to db
+        const profile = loadUserProfile(session.username);
+        if (profile) {
+          profile.botActive = false;
+          saveUserProfile(profile);
+        }
+
+        // Close all active positions
+        for (const sym of session.activeSymbols) {
+          if (session.activePositions[sym]) {
+            session.addLog(`Circuit Breaker: Market closing position for ${sym}...`, 'warning');
+            await executeCloseOrder(session, sym, 'DRAWDOWN');
+          }
+        }
+        continue;
+      }
+
+      if (session.circuitBreakerTriggered || !session.botActive) continue;
+
+      // 3. Process portfolio symbols sequentially (respect rate limits)
+      for (const symbol of session.activeSymbols) {
+        try {
+          const timeframe = '5m';
+          const ohlcv = await session.exchangeInstance.fetchOHLCV(symbol, timeframe, undefined, 100);
+
+          const fetchedCandles = ohlcv.map((c) => ({
+            time: c[0],
+            open: c[1],
+            high: c[2],
+            low: c[3],
+            close: c[4],
+            volume: c[5],
+          }));
+
+          const calculatedCandles = computeIndicators(fetchedCandles, session.stratSettings);
+          session.candlesMap[symbol] = calculatedCandles;
+          const latestCandle = calculatedCandles[calculatedCandles.length - 1];
+          const tickerPrice = latestCandle.close;
+          session.lastTickPrices[symbol] = tickerPrice;
+
+          // Check active position updates
+          const pos = session.activePositions[symbol];
+          if (pos) {
+            // Update peak/valley
+            if (pos.type === 'LONG') {
+              pos.maxObservedPrice = Math.max(pos.maxObservedPrice || pos.entryPrice, tickerPrice);
+            } else {
+              pos.minObservedPrice = Math.min(pos.minObservedPrice || pos.entryPrice, tickerPrice);
             }
 
-            if (target1Hit) {
-              addLog(`🎯 Target 1 (1.5R) hit for ${symbol} at $${pos.target1Price.toFixed(2)}. Closing 50% size.`, 'success');
-              await executeCloseOrder(symbol, 'TP', pos.size / 2);
-              
-              // Move stop loss to entry + 20% risk offset
-              const slDistance = Math.abs(pos.entryPrice - pos.stopLoss);
-              if (pos.type === 'LONG') {
-                pos.stopLoss = pos.entryPrice + slDistance * 0.2;
-              } else {
-                pos.stopLoss = pos.entryPrice - slDistance * 0.2;
+            // Partial scale out check
+            if (session.riskSettings.partialTakeProfitEnabled && !pos.halfClosed) {
+              let target1Hit = false;
+              if (pos.type === 'LONG' && tickerPrice >= pos.target1Price) {
+                target1Hit = true;
+              } else if (pos.type === 'SHORT' && tickerPrice <= pos.target1Price) {
+                target1Hit = true;
               }
-              addLog(`Locked in profit. Adjusted Stop Loss for remaining 50% position of ${symbol} to $${pos.stopLoss.toFixed(2)} (Risk-free).`, 'info');
-            }
-          }
 
-          // Trailing stop checks
-          if (riskSettings.trailingStopEnabled && !pos.halfClosed) {
-            const slDistance = Math.abs(pos.entryPrice - pos.stopLoss);
+              if (target1Hit) {
+                session.addLog(`🎯 Target 1 (1.5R) hit for ${symbol} at $${pos.target1Price.toFixed(2)}. Closing 50% size.`, 'success');
+                await executeCloseOrder(session, symbol, 'TP', pos.size / 2);
+                
+                // Move stop loss to entry + 20% risk offset
+                const slDistance = Math.abs(pos.entryPrice - pos.stopLoss);
+                if (pos.type === 'LONG') {
+                  pos.stopLoss = pos.entryPrice + slDistance * 0.2;
+                } else {
+                  pos.stopLoss = pos.entryPrice - slDistance * 0.2;
+                }
+                session.addLog(`Locked in profit. Adjusted Stop Loss for remaining 50% position of ${symbol} to $${pos.stopLoss.toFixed(2)} (Risk-free).`, 'info');
+              }
+            }
+
+            // Trailing stop checks
+            if (session.riskSettings.trailingStopEnabled && !pos.halfClosed) {
+              const slDistance = Math.abs(pos.entryPrice - pos.stopLoss);
+
+              if (pos.type === 'LONG') {
+                const trigger = pos.entryPrice + slDistance * session.riskSettings.trailingStopTrigger;
+                if (pos.maxObservedPrice > trigger) {
+                  const newSL = pos.entryPrice + slDistance * 0.2;
+                  if (newSL > pos.stopLoss) {
+                    pos.stopLoss = newSL;
+                    session.addLog(`Trailing Stop adjusted higher for LONG ${symbol} to $${newSL.toFixed(2)}.`, 'info');
+                  }
+                }
+              } else {
+                const trigger = pos.entryPrice - slDistance * session.riskSettings.trailingStopTrigger;
+                if (pos.minObservedPrice < trigger) {
+                  const newSL = pos.entryPrice - slDistance * 0.2;
+                  if (newSL < pos.stopLoss) {
+                    pos.stopLoss = newSL;
+                    session.addLog(`Trailing Stop adjusted lower for SHORT ${symbol} to $${newSL.toFixed(2)}.`, 'info');
+                  }
+                }
+              }
+            }
+
+            // Exit check
+            let hitExit = false;
+            let exitReason = null;
 
             if (pos.type === 'LONG') {
-              const trigger = pos.entryPrice + slDistance * riskSettings.trailingStopTrigger;
-              if (pos.maxObservedPrice > trigger) {
-                const newSL = pos.entryPrice + slDistance * 0.2;
-                if (newSL > pos.stopLoss) {
-                  pos.stopLoss = newSL;
-                  addLog(`Trailing Stop adjusted higher for LONG ${symbol} to $${newSL.toFixed(2)}.`, 'info');
-                }
+              if (tickerPrice <= pos.stopLoss) {
+                hitExit = true;
+                exitReason = pos.halfClosed || (session.riskSettings.trailingStopEnabled && pos.stopLoss > pos.entryPrice) ? 'TRAILING_STOP' : 'SL';
+              } else if (tickerPrice >= pos.takeProfit) {
+                hitExit = true;
+                exitReason = 'TP';
               }
             } else {
-              const trigger = pos.entryPrice - slDistance * riskSettings.trailingStopTrigger;
-              if (pos.minObservedPrice < trigger) {
-                const newSL = pos.entryPrice - slDistance * 0.2;
-                if (newSL < pos.stopLoss) {
-                  pos.stopLoss = newSL;
-                  addLog(`Trailing Stop adjusted lower for SHORT ${symbol} to $${newSL.toFixed(2)}.`, 'info');
+              if (tickerPrice >= pos.stopLoss) {
+                hitExit = true;
+                exitReason = pos.halfClosed || (session.riskSettings.trailingStopEnabled && pos.stopLoss < pos.entryPrice) ? 'TRAILING_STOP' : 'SL';
+              } else if (tickerPrice <= pos.takeProfit) {
+                hitExit = true;
+                exitReason = 'TP';
+              }
+            }
+
+            if (hitExit) {
+              session.addLog(`Exit signal triggered for ${symbol}: Price ($${tickerPrice.toFixed(2)}) hit ${exitReason} limit (${exitReason === 'TP' ? pos.takeProfit.toFixed(2) : pos.stopLoss.toFixed(2)}). Closing...`, 'warning');
+              await executeCloseOrder(session, symbol, exitReason);
+            }
+          }
+
+          // Evaluate entries
+          const openCount = Object.values(session.activePositions).filter(Boolean).length;
+          if (!pos && openCount < session.riskSettings.maxConcurrentPositions) {
+            // Check 3-candle cooldown (15 minutes on 5m candles)
+            if (session.cooldowns[symbol]) {
+              const elapsed = Date.now() - session.cooldowns[symbol];
+              const cooldownLimit = 15 * 60 * 1000; // 3 candles * 5 minutes
+              if (elapsed < cooldownLimit) {
+                // Still in cooldown
+                continue;
+              }
+            }
+
+            const decision = evaluateStrategyRules(calculatedCandles, session.stratSettings);
+
+            if (decision.signal) {
+              let mtfAligned = true;
+
+              // Check Multi-Timeframe Trend filter (using 1H for 5m strategy macro filter)
+              if (session.stratSettings.useMultiTimeframe) {
+                try {
+                  const ohlcvMacro = await session.exchangeInstance.fetchOHLCV(symbol, '1h', undefined, 50);
+                  const closesMacro = ohlcvMacro.map((c) => c[4]);
+                  const ema20_macro = calculateEMA(closesMacro, 20);
+                  const ema50_macro = calculateEMA(closesMacro, 50);
+
+                  const last20_macro = ema20_macro[ema20_macro.length - 1];
+                  const last50_macro = ema50_macro[ema50_macro.length - 1];
+
+                  if (decision.signal === 'BUY' && last20_macro < last50_macro) {
+                    mtfAligned = false;
+                    session.addLog(`Ignored BUY for ${symbol}: 1H Macro trend is bearish (1H EMA20 < 1H EMA50)`, 'info');
+                  } else if (decision.signal === 'SELL' && last20_macro > last50_macro) {
+                    mtfAligned = false;
+                    session.addLog(`Ignored SELL for ${symbol}: 1H Macro trend is bullish (1H EMA20 > 1H EMA50)`, 'info');
+                  }
+                } catch (mtfErr) {
+                  session.addLog(`Failed to fetch 1H macro trend for ${symbol}: ${mtfErr.message}. Proceeding without filter.`, 'warning');
                 }
               }
-            }
-          }
 
-          // Exit check
-          let hitExit = false;
-          let exitReason = null;
+              if (mtfAligned) {
+                session.addLog(`Signal detected for ${symbol}: ${decision.signal} (${decision.reason})`, 'warning');
 
-          if (pos.type === 'LONG') {
-            if (tickerPrice <= pos.stopLoss) {
-              hitExit = true;
-              exitReason = pos.halfClosed || (riskSettings.trailingStopEnabled && pos.stopLoss > pos.entryPrice) ? 'TRAILING_STOP' : 'SL';
-            } else if (tickerPrice >= pos.takeProfit) {
-              hitExit = true;
-              exitReason = 'TP';
-            }
-          } else {
-            if (tickerPrice >= pos.stopLoss) {
-              hitExit = true;
-              exitReason = pos.halfClosed || (riskSettings.trailingStopEnabled && pos.stopLoss < pos.entryPrice) ? 'TRAILING_STOP' : 'SL';
-            } else if (tickerPrice <= pos.takeProfit) {
-              hitExit = true;
-              exitReason = 'TP';
-            }
-          }
+                const atrValue = latestCandle.atr || (latestCandle.high - latestCandle.low) || 5.0;
+                const slDistance = atrValue * session.riskSettings.atrMultiplier;
 
-          if (hitExit) {
-            addLog(`Exit signal triggered for ${symbol}: Price ($${tickerPrice.toFixed(2)}) hit ${exitReason} limit (${exitReason === 'TP' ? pos.takeProfit.toFixed(2) : pos.stopLoss.toFixed(2)}). Closing...`, 'warning');
-            await executeCloseOrder(symbol, exitReason);
-          }
-        }
+                let slPrice = 0;
+                let tpPrice = 0;
+                let target1Price = 0;
 
-        // Evaluate entries
-        const openCount = Object.values(activePositions).filter(Boolean).length;
-        if (!pos && openCount < riskSettings.maxConcurrentPositions) {
-          const decision = evaluateStrategyRules(calculatedCandles);
-
-          if (decision.signal) {
-            let mtfAligned = true;
-
-            // Check Multi-Timeframe Trend filter
-            if (stratSettings.useMultiTimeframe) {
-              try {
-                const ohlcv4h = await exchangeInstance.fetchOHLCV(symbol, '4h', undefined, 50);
-                const closes4h = ohlcv4h.map((c) => c[4]);
-                const ema20_4h = calculateEMA(closes4h, 20);
-                const ema50_4h = calculateEMA(closes4h, 50);
-
-                const last20_4h = ema20_4h[ema20_4h.length - 1];
-                const last50_4h = ema50_4h[ema50_4h.length - 1];
-
-                if (decision.signal === 'BUY' && last20_4h < last50_4h) {
-                  mtfAligned = false;
-                  addLog(`Ignored BUY for ${symbol}: 4H Macro trend is bearish (4H EMA20 < 4H EMA50)`, 'info');
-                } else if (decision.signal === 'SELL' && last20_4h > last50_4h) {
-                  mtfAligned = false;
-                  addLog(`Ignored SELL for ${symbol}: 4H Macro trend is bullish (4H EMA20 > 4H EMA50)`, 'info');
+                if (decision.signal === 'BUY') {
+                  slPrice = tickerPrice - slDistance;
+                  tpPrice = tickerPrice + slDistance * session.riskSettings.riskRewardRatio;
+                  target1Price = tickerPrice + slDistance * 1.5;
+                } else {
+                  slPrice = tickerPrice + slDistance;
+                  tpPrice = tickerPrice - slDistance * session.riskSettings.riskRewardRatio;
+                  target1Price = tickerPrice - slDistance * 1.5;
                 }
-              } catch (mtfErr) {
-                addLog(`Failed to fetch 4H macro trend for ${symbol}: ${mtfErr.message}. Proceeding without filter.`, 'warning');
+
+                const maxLossUsd = exchangeBalance * (session.riskSettings.riskPercent / 100);
+                let size = maxLossUsd / slDistance;
+
+                const exposure = size * tickerPrice;
+                const maxAllowed = exchangeBalance * session.riskSettings.leverage;
+                if (exposure > maxAllowed) {
+                  size = maxAllowed / tickerPrice;
+                }
+
+                const tradeSide = decision.signal === 'BUY' ? 'buy' : 'sell';
+                session.addLog(`Sending Entry Order (${tradeSide.toUpperCase()}) for ${size.toFixed(4)} ${symbol} to Exchange...`, 'info');
+
+                const order = await session.exchangeInstance.createMarketOrder(symbol, tradeSide, size);
+                const fillPrice = order.price || order.average || tickerPrice;
+
+                session.activePositions[symbol] = {
+                  id: `live_${Date.now()}`,
+                  type: decision.signal === 'BUY' ? 'LONG' : 'SHORT',
+                  symbol: symbol,
+                  entryPrice: fillPrice,
+                  entryTime: Date.now(),
+                  size: size,
+                  leverage: session.riskSettings.leverage,
+                  stopLoss: parseFloat(slPrice.toFixed(2)),
+                  takeProfit: parseFloat(tpPrice.toFixed(2)),
+                  target1Price: parseFloat(target1Price.toFixed(2)),
+                  halfClosed: false,
+                  pnl: 0,
+                  pnlPercent: 0,
+                  status: 'OPEN',
+                  maxObservedPrice: fillPrice,
+                  minObservedPrice: fillPrice,
+                };
+
+                session.addLog(`📥 Executed live entry for ${symbol} at $${fillPrice}. SL: $${slPrice.toFixed(2)}, Target 1 (1.5R): $${target1Price.toFixed(2)}, Target 2 (${session.riskSettings.riskRewardRatio}R): $${tpPrice.toFixed(2)}`, 'success');
               }
-            }
-
-            if (mtfAligned) {
-              addLog(`Signal detected for ${symbol}: ${decision.signal} (${decision.reason})`, 'warning');
-
-              const atrValue = latestCandle.atr || (latestCandle.high - latestCandle.low) || 5.0;
-              const slDistance = atrValue * riskSettings.atrMultiplier;
-
-              let slPrice = 0;
-              let tpPrice = 0;
-              let target1Price = 0;
-
-              if (decision.signal === 'BUY') {
-                slPrice = tickerPrice - slDistance;
-                tpPrice = tickerPrice + slDistance * riskSettings.riskRewardRatio;
-                target1Price = tickerPrice + slDistance * 1.5;
-              } else {
-                slPrice = tickerPrice + slDistance;
-                tpPrice = tickerPrice - slDistance * riskSettings.riskRewardRatio;
-                target1Price = tickerPrice - slDistance * 1.5;
-              }
-
-              const maxLossUsd = exchangeBalance * (riskSettings.riskPercent / 100);
-              let size = maxLossUsd / slDistance;
-
-              const exposure = size * tickerPrice;
-              const maxAllowed = exchangeBalance * riskSettings.leverage;
-              if (exposure > maxAllowed) {
-                size = maxAllowed / tickerPrice;
-              }
-
-              const tradeSide = decision.signal === 'BUY' ? 'buy' : 'sell';
-              addLog(`Sending Entry Order (${tradeSide.toUpperCase()}) for ${size.toFixed(4)} ${symbol} to Exchange...`, 'info');
-
-              const order = await exchangeInstance.createMarketOrder(symbol, tradeSide, size);
-              const fillPrice = order.price || order.average || tickerPrice;
-
-              activePositions[symbol] = {
-                id: `live_${Date.now()}`,
-                type: decision.signal === 'BUY' ? 'LONG' : 'SHORT',
-                symbol: symbol,
-                entryPrice: fillPrice,
-                entryTime: Date.now(),
-                size: size,
-                leverage: riskSettings.leverage,
-                stopLoss: parseFloat(slPrice.toFixed(2)),
-                takeProfit: parseFloat(tpPrice.toFixed(2)),
-                target1Price: parseFloat(target1Price.toFixed(2)),
-                halfClosed: false,
-                pnl: 0,
-                pnlPercent: 0,
-                status: 'OPEN',
-                maxObservedPrice: fillPrice,
-                minObservedPrice: fillPrice,
-              };
-
-              addLog(`📥 Executed live entry for ${symbol} at $${fillPrice}. SL: $${slPrice.toFixed(2)}, Target 1 (1.5R): $${target1Price.toFixed(2)}, Target 2 (${riskSettings.riskRewardRatio}R): $${tpPrice.toFixed(2)}`, 'success');
             }
           }
-        }
 
-        await sleep(500); // Prevent API rate limits
-      } catch (symbolErr) {
-        addLog(`Error processing ${symbol} polling: ${symbolErr.message}`, 'danger');
+          await sleep(500); // Prevent API rate limits
+        } catch (symbolErr) {
+          session.addLog(`Error processing ${symbol} polling: ${symbolErr.message}`, 'danger');
+        }
       }
+    } catch (userErr) {
+      session.addLog(`Error in user session loop for ${username}: ${userErr.message}`, 'danger');
     }
-  } catch (err) {
-    addLog(`Error in background live execution loop: ${err.message}`, 'danger');
   }
 }, 10000); // Ticks every 10 seconds
 
@@ -1015,12 +1314,12 @@ setInterval(async () => {
 const distPath = path.join(__dirname, 'dist');
 if (fs.existsSync(distPath)) {
   app.use(express.static(distPath));
-  app.get('/{*splat}', (req, res) => {
+  app.use((req, res) => {
     res.sendFile(path.join(distPath, 'index.html'));
   });
 }
 
 // Start backend server
 app.listen(PORT, () => {
-  addLog(`Express Server running on port ${PORT}. Ready to accept exchange API calls.`, 'success');
+  console.log(`[SYSTEM] Express Server running on port ${PORT}. Ready to accept exchange API calls.`);
 });
