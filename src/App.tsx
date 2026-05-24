@@ -136,6 +136,9 @@ export default function App() {
   // --- Backtest Results State ---
   const [backtestResults, setBacktestResults] = useState<BacktestResults | null>(null);
 
+  // --- Real-time Evaluation Diagnostics ---
+  const [evaluationStates, setEvaluationStates] = useState<Record<string, any>>({});
+
   const [hasUnappliedChanges, setHasUnappliedChanges] = useState(false);
   const isFirstRender = useRef(true);
 
@@ -206,6 +209,9 @@ export default function App() {
           });
           setBotActive(data.botActive);
           setAllPositions(data.allPositions || []);
+          if (data.evaluationStates) {
+            setEvaluationStates(data.evaluationStates);
+          }
 
           // Auto-sync backend active settings to UI if no unapplied changes are pending
           if (!hasUnappliedChanges) {
@@ -830,6 +836,7 @@ export default function App() {
                 onClosePosition={handleManualClose}
                 latestPrice={currentPrice}
                 allPositions={botMode === 'EXCHANGE_LIVE' ? allPositions : activePosition ? [activePosition] : []}
+                evaluationStates={evaluationStates}
               />
             </div>
           </div>

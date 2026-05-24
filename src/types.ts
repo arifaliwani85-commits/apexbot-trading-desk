@@ -104,3 +104,20 @@ export interface BacktestResults {
   sharpeRatio: number;
   trades: Position[];
 }
+
+export interface EvaluationState {
+  timestamp: number;
+  strategy: string;
+  regime: string;
+  emaState: string;
+  rsi: number;
+  atr: number;
+  adx: number;
+  volume: number;
+  status: 'WAITING_FOR_SIGNAL' | 'REJECTED' | 'EXECUTING' | 'ERROR' | 'COOLDOWN' | 'POSITION_OPEN';
+  reason: string;
+  calculatedSize?: number;
+  minNotional?: number;
+  payload?: any;
+  error?: string;
+}

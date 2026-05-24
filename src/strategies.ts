@@ -13,12 +13,11 @@ export function evaluateStrategy(
   if (len < 5) return { signal: null, reason: 'Insufficient data' };
 
   const current = candles[len - 1];
-  const previous = candles[len - 2];
 
   // We run checks based on the strategy type
   switch (settings.strategyType) {
     case 'TREND_FOLLOWING':
-      return checkTrendFollowing(current, previous, settings);
+      return checkTrendFollowing(current, settings, candles);
     case 'MEAN_REVERSION':
       return checkMeanReversion(candles, settings);
     case 'MOMENTUM_BREAKOUT':
@@ -30,81 +29,87 @@ export function evaluateStrategy(
   }
 }
 
-// Trend Following strategy: EMA golden/death cross + trend filter (EMA 200) + RSI confirmation + ADX trend check + VWAP proximity check
+// Trend Following strategy: EMA state-based trend + pullback zone + RSI + ADX + VWAP proximity check
 function checkTrendFollowing(
   current: Candle,
-  previous: Candle,
-  settings: StrategySettings
+  settings: StrategySettings,
+  candles: Candle[]
 ): SignalResult {
-  const { ema20: emaShortCurr, ema50: emaLongCurr, ema200: emaTrendCurr, rsi: rsiCurr, adx: adxCurr, vwap: vwapCurr } = current;
-  const { ema20: emaShortPrev, ema50: emaLongPrev } = previous;
+  const { ema20, ema50, ema200, rsi, adx, vwap } = current;
 
-  const threshold = settings.adxThreshold !== undefined ? settings.adxThreshold : 30;
+  const threshold = settings.adxThreshold !== undefined ? settings.adxThreshold : 25;
 
   if (
-    emaShortCurr === undefined ||
-    emaLongCurr === undefined ||
-    emaTrendCurr === undefined ||
-    emaShortPrev === undefined ||
-    emaLongPrev === undefined ||
-    rsiCurr === undefined ||
-    adxCurr === undefined ||
-    vwapCurr === undefined
+    ema20 === undefined ||
+    ema50 === undefined ||
+    ema200 === undefined ||
+    rsi === undefined ||
+    adx === undefined ||
+    vwap === undefined
   ) {
     return { signal: null, reason: 'Indicators not fully calculated' };
   }
 
-  const isGoldenCross = emaShortPrev <= emaLongPrev && emaShortCurr > emaLongCurr;
-  const isUpTrend = current.close > emaTrendCurr;
-  const rsiNotOverbought = rsiCurr < settings.rsiOverbought;
-  const hasStrongTrend = adxCurr > threshold;
-  
-  // Risk control: Buy when price is not too far above VWAP (within 0.2% of VWAP for 5m conservative entries)
-  const nearVWAPBuy = current.close <= vwapCurr * 1.002;
+  // 1. ADX Trend check
+  if (adx < threshold) {
+    return { signal: null, reason: `ADX (${adx.toFixed(1)}) is below threshold (${threshold}) - choppy sideways market` };
+  }
 
-  if (isGoldenCross) {
-    if (isUpTrend && rsiNotOverbought && hasStrongTrend && nearVWAPBuy) {
-      return {
-        signal: 'BUY',
-        reason: `EMA Golden Cross. Price ($${current.close.toFixed(2)}) is above EMA200 ($${emaTrendCurr.toFixed(2)}) indicating uptrend. RSI is ${rsiCurr.toFixed(1)}. ADX is strong at ${adxCurr.toFixed(1)} (> ${threshold}). Price is near VWAP fair value ($${vwapCurr.toFixed(2)}).`,
-      };
-    } else if (!isUpTrend) {
-      return { signal: null, reason: 'Golden Cross ignored: Price is below EMA200 (Long-term downtrend)' };
-    } else if (!rsiNotOverbought) {
-      return { signal: null, reason: `Golden Cross ignored: RSI (${rsiCurr.toFixed(1)}) is overbought` };
-    } else if (!hasStrongTrend) {
-      return { signal: null, reason: `Golden Cross ignored: Weak trend strength. ADX is ${adxCurr.toFixed(1)} (<= ${threshold})` };
-    } else {
-      return { signal: null, reason: `Golden Cross ignored: Price is too extended above VWAP ($${current.close.toFixed(2)} vs VWAP $${vwapCurr.toFixed(2)})` };
+  // 2. Volume check (avoid low volume chop)
+  const len = candles.length;
+  const lookback = 20;
+  if (len >= lookback) {
+    let totalVol = 0;
+    for (let i = len - 1 - lookback; i < len - 1; i++) {
+      totalVol += candles[i].volume || 1;
+    }
+    const avgVol = totalVol / lookback;
+    if (current.volume < avgVol * 0.8) {
+      return { signal: null, reason: `Low volume: current candle volume (${current.volume.toFixed(0)}) < 80% of average (${(avgVol * 0.8).toFixed(0)})` };
     }
   }
 
-  // Bearish Death Cross: EMA20 crosses below EMA50 AND Price is below EMA200
-  const isDeathCross = emaShortPrev >= emaLongPrev && emaShortCurr < emaLongCurr;
-  const isDownTrend = current.close < emaTrendCurr;
-  const rsiNotOversold = rsiCurr > settings.rsiOversold;
-  
-  // Risk control: Short when price is not too far below VWAP (within 0.2% of VWAP for 5m conservative entries)
-  const nearVWAPSell = current.close >= vwapCurr * 0.998;
+  // 3. Trend Direction
+  const isBullish = ema20 > ema50 && current.close > ema200;
+  const isBearish = ema20 < ema50 && current.close < ema200;
 
-  if (isDeathCross) {
-    if (isDownTrend && rsiNotOversold && hasStrongTrend && nearVWAPSell) {
-      return {
-        signal: 'SELL',
-        reason: `EMA Death Cross. Price ($${current.close.toFixed(2)}) is below EMA200 ($${emaTrendCurr.toFixed(2)}) indicating downtrend. RSI is ${rsiCurr.toFixed(1)}. ADX is strong at ${adxCurr.toFixed(1)} (> ${threshold}). Price is near VWAP fair value ($${vwapCurr.toFixed(2)}).`,
-      };
-    } else if (!isDownTrend) {
-      return { signal: null, reason: 'Death Cross ignored: Price is above EMA200 (Long-term uptrend)' };
-    } else if (!rsiNotOversold) {
-      return { signal: null, reason: `Death Cross ignored: RSI (${rsiCurr.toFixed(1)}) is oversold` };
-    } else if (!hasStrongTrend) {
-      return { signal: null, reason: `Death Cross ignored: Weak trend strength. ADX is ${adxCurr.toFixed(1)} (<= ${threshold})` };
-    } else {
-      return { signal: null, reason: `Death Cross ignored: Price is too extended below VWAP ($${current.close.toFixed(2)} vs VWAP $${vwapCurr.toFixed(2)})` };
+  if (isBullish) {
+    if (rsi >= settings.rsiOverbought) {
+      return { signal: null, reason: `Uptrend BUY ignored: RSI (${rsi.toFixed(1)}) is overbought (>= ${settings.rsiOverbought})` };
     }
+    const isPullback = current.close <= ema20 * 1.003;
+    if (!isPullback) {
+      return { signal: null, reason: `Uptrend BUY ignored: Price is too extended above EMA20 ($${current.close.toFixed(2)} vs EMA20 $${ema20.toFixed(2)})` };
+    }
+    if (current.close > vwap * 1.005) {
+      return { signal: null, reason: `Uptrend BUY ignored: Price is too extended above VWAP ($${current.close.toFixed(2)} vs VWAP $${vwap.toFixed(2)})` };
+    }
+
+    return {
+      signal: 'BUY',
+      reason: `Trend Follow Buy: EMA20 > EMA50 ($${ema20.toFixed(2)} > $${ema50.toFixed(2)}), Close > EMA200 ($${current.close.toFixed(2)} > $${ema200.toFixed(2)}), RSI (${rsi.toFixed(1)}) healthy, price near EMA20 pullback zone`
+    };
   }
 
-  return { signal: null, reason: 'No crossover detected' };
+  if (isBearish) {
+    if (rsi <= settings.rsiOversold) {
+      return { signal: null, reason: `Downtrend SELL ignored: RSI (${rsi.toFixed(1)}) is oversold (<= ${settings.rsiOversold})` };
+    }
+    const isPullback = current.close >= ema20 * 0.997;
+    if (!isPullback) {
+      return { signal: null, reason: `Downtrend SELL ignored: Price is too extended below EMA20 ($${current.close.toFixed(2)} vs EMA20 $${ema20.toFixed(2)})` };
+    }
+    if (current.close < vwap * 0.995) {
+      return { signal: null, reason: `Downtrend SELL ignored: Price is too extended below VWAP ($${current.close.toFixed(2)} vs VWAP $${vwap.toFixed(2)})` };
+    }
+
+    return {
+      signal: 'SELL',
+      reason: `Trend Follow Sell: EMA20 < EMA50 ($${ema20.toFixed(2)} < $${ema50.toFixed(2)}), Close < EMA200 ($${current.close.toFixed(2)} < $${ema200.toFixed(2)}), RSI (${rsi.toFixed(1)}) healthy, price near EMA20 pullback zone`
+    };
+  }
+
+  return { signal: null, reason: 'EMAs or Price not aligned in a trend' };
 }
 
 // Mean Reversion strategy: Bollinger Band touches + RSI + ADX filter (avoids catching falling knives in strong trends)
@@ -260,37 +265,54 @@ function checkMomentumBreakout(
 
 function checkHighFrequencyScalper(
   candles: Candle[],
-  _settings: StrategySettings
+  settings: StrategySettings
 ): SignalResult {
   const len = candles.length;
   if (len < 5) return { signal: null, reason: 'Insufficient data' };
 
   const current = candles[len - 1];
-
-  const { ema20: emaShortCurr, ema50: emaLongCurr, rsi: rsiCurr } = current;
+  const { ema20, ema50, rsi } = current;
 
   if (
-    emaShortCurr === undefined ||
-    emaLongCurr === undefined ||
-    rsiCurr === undefined
+    ema20 === undefined ||
+    ema50 === undefined ||
+    rsi === undefined
   ) {
     return { signal: null, reason: 'Indicators not fully calculated' };
   }
 
-  // Active state entry: BUY if short EMA > long EMA, SELL if short EMA < long EMA
-  if (emaShortCurr > emaLongCurr) {
+  const isBullish = ema20 > ema50;
+  const isBearish = ema20 < ema50;
+
+  if (isBullish) {
+    if (rsi >= settings.rsiOverbought) {
+      return { signal: null, reason: `Scalp BUY ignored: RSI (${rsi.toFixed(1)}) is overbought (>= ${settings.rsiOverbought})` };
+    }
+    const isPullback = current.close <= ema20 * 1.005;
+    if (!isPullback) {
+      return { signal: null, reason: `Scalp BUY ignored: Price is too extended above EMA20 ($${current.close.toFixed(2)} vs EMA20 $${ema20.toFixed(2)})` };
+    }
+
     return {
       signal: 'BUY',
-      reason: `HF Scalper: EMA Short (${emaShortCurr.toFixed(2)}) > EMA Long (${emaLongCurr.toFixed(2)}) on 5m chart. (RSI: ${rsiCurr.toFixed(1)})`,
+      reason: `HF Scalp Buy: EMA20 > EMA50 ($${ema20.toFixed(2)} > $${ema50.toFixed(2)}) and RSI is healthy at ${rsi.toFixed(1)}`
     };
   }
 
-  if (emaShortCurr < emaLongCurr) {
+  if (isBearish) {
+    if (rsi <= settings.rsiOversold) {
+      return { signal: null, reason: `Scalp SELL ignored: RSI (${rsi.toFixed(1)}) is oversold (<= ${settings.rsiOversold})` };
+    }
+    const isPullback = current.close >= ema20 * 0.995;
+    if (!isPullback) {
+      return { signal: null, reason: `Scalp SELL ignored: Price is too extended below EMA20 ($${current.close.toFixed(2)} vs EMA20 $${ema20.toFixed(2)})` };
+    }
+
     return {
       signal: 'SELL',
-      reason: `HF Scalper: EMA Short (${emaShortCurr.toFixed(2)}) < EMA Long (${emaLongCurr.toFixed(2)}) on 5m chart. (RSI: ${rsiCurr.toFixed(1)})`,
+      reason: `HF Scalp Sell: EMA20 < EMA50 ($${ema20.toFixed(2)} < $${ema50.toFixed(2)}) and RSI is healthy at ${rsi.toFixed(1)}`
     };
   }
 
-  return { signal: null, reason: 'No crossover detected' };
+  return { signal: null, reason: 'EMA20 and EMA50 are crossing or flat' };
 }

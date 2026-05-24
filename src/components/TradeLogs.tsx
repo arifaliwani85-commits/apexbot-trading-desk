@@ -1,6 +1,6 @@
 import React, { useRef, useEffect, useState } from 'react';
 import type { Position, LogMessage } from '../types';
-import { Terminal, Briefcase, History, X } from 'lucide-react';
+import { Terminal, Briefcase, History, X, Activity } from 'lucide-react';
 
 interface TradeLogsProps {
   activePosition: Position | null;
@@ -9,6 +9,7 @@ interface TradeLogsProps {
   onClosePosition: (symbol?: string) => void;
   latestPrice: number;
   allPositions?: Position[];
+  evaluationStates?: Record<string, any>;
 }
 
 export const TradeLogs: React.FC<TradeLogsProps> = ({
@@ -18,8 +19,9 @@ export const TradeLogs: React.FC<TradeLogsProps> = ({
   onClosePosition,
   latestPrice,
   allPositions = [],
+  evaluationStates = {},
 }) => {
-  const [activeTab, setActiveTab] = useState<'positions' | 'logs' | 'history'>('positions');
+  const [activeTab, setActiveTab] = useState<'positions' | 'logs' | 'history' | 'diagnostics'>('positions');
   const logEndRef = useRef<HTMLDivElement>(null);
 
   // Auto-scroll logs to bottom
@@ -68,6 +70,13 @@ export const TradeLogs: React.FC<TradeLogsProps> = ({
         >
           <History size={12} style={{ marginRight: '5px', verticalAlign: 'middle' }} />
           HISTORY ({closedTrades.length})
+        </button>
+        <button
+          className={`tab-btn ${activeTab === 'diagnostics' ? 'active' : ''}`}
+          onClick={() => setActiveTab('diagnostics')}
+        >
+          <Activity size={12} style={{ marginRight: '5px', verticalAlign: 'middle' }} />
+          BOT DIAGNOSTICS ({Object.keys(evaluationStates).length})
         </button>
       </div>
 
@@ -289,6 +298,121 @@ export const TradeLogs: React.FC<TradeLogsProps> = ({
                 }}
               >
                 No trade history yet.
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* BOT DIAGNOSTICS Tab */}
+        {activeTab === 'diagnostics' && (
+          <div style={{ padding: '16px', height: '100%', overflowY: 'auto' }}>
+            {Object.keys(evaluationStates).length === 0 ? (
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--text-muted)' }}>
+                No diagnostics data received.
+                <div style={{ fontSize: '11px', marginTop: '6px', textAlign: 'center' }}>
+                  Wait for the bot background loop to execute (ticking every 10 seconds).
+                </div>
+              </div>
+            ) : (
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: '12px' }}>
+                {Object.keys(evaluationStates).map((symbol) => {
+                  const evalState = evaluationStates[symbol];
+                  if (!evalState) return null;
+
+                  const rsi = parseFloat(evalState.rsi);
+                  const adx = parseFloat(evalState.adx);
+                  const isRsiOverbought = rsi >= 70;
+                  const isRsiOversold = rsi <= 30;
+                  const isAdxTrending = adx >= 25;
+
+                  let badgeClass = 'badge-secondary';
+                  let statusColor = 'var(--text-secondary)';
+                  if (evalState.status === 'POSITION_OPEN' || evalState.status === 'EXECUTING') {
+                    badgeClass = 'badge-long'; // green
+                    statusColor = 'var(--accent-green)';
+                  } else if (evalState.status === 'WAITING_FOR_SIGNAL') {
+                    badgeClass = 'badge-blue';
+                    statusColor = 'var(--accent-blue)';
+                  } else if (evalState.status === 'REJECTED' || evalState.status === 'ERROR') {
+                    badgeClass = 'badge-short'; // red
+                    statusColor = 'var(--accent-red)';
+                  } else if (evalState.status === 'COOLDOWN') {
+                    badgeClass = 'badge-gold';
+                    statusColor = 'var(--accent-gold)';
+                  }
+
+                  return (
+                    <div
+                      key={symbol}
+                      style={{
+                        background: 'var(--bg-tertiary)',
+                        border: '1px solid var(--border-color)',
+                        borderRadius: 'var(--radius-md)',
+                        padding: '12px',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '8px',
+                        boxShadow: '0 2px 8px rgba(0, 0, 0, 0.05)',
+                        transition: 'all 0.2s',
+                        cursor: 'default',
+                      }}
+                      onMouseEnter={(e) => { e.currentTarget.style.borderColor = statusColor; e.currentTarget.style.boxShadow = `0 0 10px ${statusColor}1A`; }}
+                      onMouseLeave={(e) => { e.currentTarget.style.borderColor = 'var(--border-color)'; e.currentTarget.style.boxShadow = '0 2px 8px rgba(0, 0, 0, 0.05)'; }}
+                    >
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <span style={{ fontWeight: 'bold', fontFamily: 'var(--font-mono)', fontSize: '13px' }}>{symbol}</span>
+                        <span
+                          className={`badge ${badgeClass}`}
+                          style={{
+                            fontSize: '9px',
+                            padding: '2px 6px',
+                            fontWeight: 'bold',
+                            letterSpacing: '0.5px',
+                            ...(evalState.status === 'WAITING_FOR_SIGNAL' ? { backgroundColor: 'rgba(59, 130, 246, 0.1)', color: '#3b82f6', border: '1px solid rgba(59, 130, 246, 0.2)' } : {}),
+                            ...(evalState.status === 'COOLDOWN' ? { backgroundColor: 'rgba(245, 158, 11, 0.1)', color: '#f59e0b', border: '1px solid rgba(245, 158, 11, 0.2)' } : {}),
+                          }}
+                        >
+                          {evalState.status}
+                        </span>
+                      </div>
+
+                      <div style={{ fontSize: '11px', color: 'var(--text-secondary)', lineHeight: '1.4' }}>
+                        <strong>Decision:</strong> {evalState.reason}
+                      </div>
+
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px', fontSize: '10px', fontFamily: 'var(--font-mono)', borderTop: '1px solid var(--border-color)', paddingTop: '8px', marginTop: '4px' }}>
+                        <div>
+                          <span style={{ color: 'var(--text-muted)' }}>RSI: </span>
+                          <span style={{
+                            fontWeight: 'bold',
+                            color: isRsiOverbought ? 'var(--accent-red)' : isRsiOversold ? 'var(--accent-green)' : 'var(--text-primary)'
+                          }}>
+                            {isNaN(rsi) ? 'N/A' : rsi.toFixed(1)}
+                          </span>
+                        </div>
+                        <div>
+                          <span style={{ color: 'var(--text-muted)' }}>ADX: </span>
+                          <span style={{
+                            fontWeight: 'bold',
+                            color: isAdxTrending ? 'var(--accent-green)' : 'var(--text-muted)'
+                          }}>
+                            {isNaN(adx) ? 'N/A' : adx.toFixed(1)}
+                          </span>
+                        </div>
+                        <div style={{ gridColumn: 'span 2' }}>
+                          <span style={{ color: 'var(--text-muted)' }}>EMA: </span>
+                          <span style={{ color: 'var(--text-primary)', fontWeight: 'bold' }}>{evalState.emaState || 'N/A'}</span>
+                        </div>
+                        {evalState.minNotional !== undefined && (
+                          <div style={{ gridColumn: 'span 2', color: 'var(--text-muted)' }}>
+                            <span>Min Cost: </span>
+                            <span style={{ color: 'var(--text-secondary)' }}>${evalState.minNotional.toFixed(2)} USDT</span>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             )}
           </div>

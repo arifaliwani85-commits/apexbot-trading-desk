@@ -177,6 +177,7 @@ function getOrCreateSession(username) {
     lastCircuitBreakerCheckDate: '',
     circuitBreakerTriggered: false,
     cooldowns: {}, // symbol -> timestamp of exit
+    evaluationStates: {}, // symbol -> EvaluationState
     stratSettings: profile.stratSettings || {
       strategyType: 'TREND_FOLLOWING',
       emaShortPeriod: 20,
@@ -270,6 +271,97 @@ function initAllActiveSessions() {
 
 // Initial boot restoration
 setTimeout(initAllActiveSessions, 1000);
+
+// --- Exchange & Sizing & Logging Helpers ---
+function getMarketSymbol(session, symbol) {
+  if (session.exchangeInstance && session.exchangeConfig.exchangeId === 'bybit') {
+    const swapSymbol = `${symbol}:USDT`;
+    if (session.exchangeInstance.markets && session.exchangeInstance.markets[swapSymbol]) {
+      return swapSymbol;
+    }
+  }
+  return symbol;
+}
+
+function getMinOrderSize(session, marketSymbol, price) {
+  if (!session.exchangeInstance || !session.exchangeInstance.markets) return 0;
+  const market = session.exchangeInstance.markets[marketSymbol];
+  if (!market) return 0;
+
+  let minAmount = 0;
+  let minCost = 0;
+
+  if (market.limits) {
+    if (market.limits.amount && market.limits.amount.min !== undefined) {
+      minAmount = market.limits.amount.min;
+    }
+    if (market.limits.cost && market.limits.cost.min !== undefined) {
+      minCost = market.limits.cost.min;
+    }
+  }
+
+  // Enforce a $5.0 USDT notional minimum for Bybit
+  if (session.exchangeConfig.exchangeId === 'bybit' && minCost < 5.0) {
+    minCost = 5.0;
+  }
+
+  const sizeFromCost = minCost > 0 ? minCost / price : 0;
+  return Math.max(minAmount, sizeFromCost);
+}
+
+async function safeCreateMarketOrder(exchangeInstance, symbol, side, amount, addLog) {
+  let attempts = 3;
+  let delay = 1000;
+  const ccxtLib = getCcxt();
+
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      addLog(`Sending Market Order to Exchange (Attempt ${i}/${attempts}): ${side.toUpperCase()} ${amount} ${symbol}`, 'info');
+      const order = await exchangeInstance.createMarketOrder(symbol, side, amount);
+      return order;
+    } catch (err) {
+      const isTransient = (ccxtLib.NetworkError && err instanceof ccxtLib.NetworkError) ||
+                          (ccxtLib.RequestTimeout && err instanceof ccxtLib.RequestTimeout) ||
+                          (ccxtLib.RateLimitExceeded && err instanceof ccxtLib.RateLimitExceeded) ||
+                          err.message.includes('timeout') ||
+                          err.message.includes('Rate limit') ||
+                          err.message.includes('rateLimit');
+
+      if (isTransient && i < attempts) {
+        addLog(`Transient exchange error (Attempt ${i} failed): ${err.message}. Retrying in ${delay}ms...`, 'warning');
+        await new Promise((r) => setTimeout(r, delay));
+        delay *= 1.5;
+      } else {
+        throw err;
+      }
+    }
+  }
+}
+
+function logTickDetails(username, symbol, details) {
+  try {
+    const logDir = path.join(__dirname, 'db', 'logs');
+    if (!fs.existsSync(logDir)) {
+      fs.mkdirSync(logDir, { recursive: true });
+    }
+    const logPath = path.join(logDir, `${username}_ticks.log`);
+    const timestamp = new Date().toISOString();
+    const line = `[${timestamp}] [${symbol}] Regime: ${details.regime} | EMA State: ${details.emaState} | RSI: ${details.rsi !== undefined && !isNaN(details.rsi) ? details.rsi.toFixed(2) : 'N/A'} | ATR: ${details.atr !== undefined && !isNaN(details.atr) ? details.atr.toFixed(4) : 'N/A'} | ADX: ${details.adx !== undefined && !isNaN(details.adx) ? details.adx.toFixed(2) : 'N/A'} | Status: ${details.status} | Reason: ${details.reason} | Size: ${details.calculatedSize !== undefined && !isNaN(details.calculatedSize) ? details.calculatedSize.toFixed(4) : 'N/A'} | MinNotional: ${details.minNotional !== undefined && !isNaN(details.minNotional) ? details.minNotional.toFixed(2) : 'N/A'}${details.error ? ` | Error: ${details.error}` : ''}\n`;
+    
+    fs.appendFileSync(logPath, line);
+    
+    // Rotate logs if file exceeds 5MB
+    const stats = fs.statSync(logPath);
+    if (stats.size > 5 * 1024 * 1024) {
+      const data = fs.readFileSync(logPath, 'utf8');
+      const lines = data.split('\n');
+      const truncated = lines.slice(-2000).join('\n');
+      fs.writeFileSync(logPath, truncated);
+    }
+  } catch (e) {
+    console.error('Failed to write to tick log:', e);
+  }
+}
 
 // --- Math & Indicator Helper Functions ---
 function calculateEMA(prices, period) {
@@ -538,70 +630,165 @@ function computeIndicators(candlesList, stratSettings) {
 // Evaluate Strategy Entry Signals
 function evaluateStrategyRules(candlesList, stratSettings) {
   const len = candlesList.length;
-  if (len < 5) return { signal: null };
+  if (len < 5) return { signal: null, reason: 'Insufficient historical data (requires at least 5 candles)' };
 
   const current = candlesList[len - 1];
   const previous = candlesList[len - 2];
 
   if (stratSettings.strategyType === 'TREND_FOLLOWING') {
     const { ema20, ema50, ema200, rsi, adx } = current;
-    const { ema20: emaShortPrev, ema50: emaLongPrev } = previous;
     
-    if (!ema20 || !ema50 || !ema200 || !emaShortPrev || !emaLongPrev || !rsi || !adx) return { signal: null };
+    if (!ema20 || !ema50 || !ema200 || rsi === undefined || adx === undefined) {
+      return { signal: null, reason: 'Indicators not fully calculated' };
+    }
 
-    // Enforce stricter ADX check
-    if (adx < stratSettings.adxThreshold) return { signal: null };
+    // 1. ADX Trend filter (avoid sideways chop)
+    const adxThreshold = stratSettings.adxThreshold !== undefined ? stratSettings.adxThreshold : 25;
+    if (adx < adxThreshold) {
+      return { signal: null, reason: `ADX (${adx.toFixed(1)}) is below threshold (${adxThreshold}) - ranging/choppy market` };
+    }
 
-    // Golden Cross
-    if (emaShortPrev <= emaLongPrev && ema20 > ema50) {
-      if (current.close > ema200 && rsi < stratSettings.rsiOverbought) {
-        // Strict VWAP limit - close or below fair value
-        if (current.vwap && current.close <= current.vwap * 1.002) {
-          return { signal: 'BUY', reason: `EMA Golden Cross with RSI & VWAP entry confirmation (ADX: ${adx.toFixed(1)} > ${stratSettings.adxThreshold})` };
-        }
+    // 2. Volume filter (avoid low volume chop)
+    const lookback = 20;
+    if (len >= lookback) {
+      let totalVol = 0;
+      for (let i = len - 1 - lookback; i < len - 1; i++) {
+        totalVol += candlesList[i].volume || 1;
+      }
+      const avgVol = totalVol / lookback;
+      if (current.volume < avgVol * 0.8) {
+        return { signal: null, reason: `Low volume: current candle volume (${current.volume.toFixed(0)}) < 80% of average (${(avgVol * 0.8).toFixed(0)})` };
       }
     }
-    // Death Cross
-    if (emaShortPrev >= emaLongPrev && ema20 < ema50) {
-      if (current.close < ema200 && rsi > stratSettings.rsiOversold) {
-        // Strict VWAP limit - close or above fair value
-        if (current.vwap && current.close >= current.vwap * 0.998) {
-          return { signal: 'SELL', reason: `EMA Death Cross with RSI & VWAP entry confirmation (ADX: ${adx.toFixed(1)} > ${stratSettings.adxThreshold})` };
-        }
+
+    // 3. EMA trend direction
+    const isBullishTrend = ema20 > ema50 && current.close > ema200;
+    const isBearishTrend = ema20 < ema50 && current.close < ema200;
+
+    if (isBullishTrend) {
+      // Check RSI is not overbought
+      if (rsi >= stratSettings.rsiOverbought) {
+        return { signal: null, reason: `RSI (${rsi.toFixed(1)}) is overbought (>= ${stratSettings.rsiOverbought})` };
       }
+      // Pullback check: close is near EMA20 (within 0.3% of EMA20) to avoid buying the top
+      const isPullback = current.close <= ema20 * 1.003;
+      if (!isPullback) {
+        return { signal: null, reason: `Price ($${current.close.toFixed(2)}) is too extended above EMA20 ($${ema20.toFixed(2)})` };
+      }
+      // Proximity to VWAP
+      if (current.vwap && current.close > current.vwap * 1.005) {
+        return { signal: null, reason: `Price ($${current.close.toFixed(2)}) is too extended above VWAP ($${current.vwap.toFixed(2)})` };
+      }
+
+      return {
+        signal: 'BUY',
+        reason: `EMA20 > EMA50 ($${ema20.toFixed(2)} > $${ema50.toFixed(2)}), Close > EMA200 ($${current.close.toFixed(2)} > $${ema200.toFixed(2)}), RSI (${rsi.toFixed(1)}) healthy, price near EMA20 pullback zone`
+      };
     }
+
+    if (isBearishTrend) {
+      // Check RSI is not oversold
+      if (rsi <= stratSettings.rsiOversold) {
+        return { signal: null, reason: `RSI (${rsi.toFixed(1)}) is oversold (<= ${stratSettings.rsiOversold})` };
+      }
+      // Pullback check: close is near EMA20 (within 0.3% of EMA20) to avoid selling the bottom
+      const isPullback = current.close >= ema20 * 0.997;
+      if (!isPullback) {
+        return { signal: null, reason: `Price ($${current.close.toFixed(2)}) is too extended below EMA20 ($${ema20.toFixed(2)})` };
+      }
+      // Proximity to VWAP
+      if (current.vwap && current.close < current.vwap * 0.995) {
+        return { signal: null, reason: `Price ($${current.close.toFixed(2)}) is too extended below VWAP ($${current.vwap.toFixed(2)})` };
+      }
+
+      return {
+        signal: 'SELL',
+        reason: `EMA20 < EMA50 ($${ema20.toFixed(2)} < $${ema50.toFixed(2)}), Close < EMA200 ($${current.close.toFixed(2)} < $${ema200.toFixed(2)}), RSI (${rsi.toFixed(1)}) healthy, price near EMA20 pullback zone`
+      };
+    }
+
+    return { signal: null, reason: 'EMAs or Price not aligned in a trend (Bullish: EMA20>EMA50 & Close>EMA200, Bearish: EMA20<EMA50 & Close<EMA200)' };
+
   } else if (stratSettings.strategyType === 'HIGH_FREQUENCY_SCALPER') {
     const { ema20, ema50, rsi } = current;
     
-    if (!ema20 || !ema50 || !rsi) return { signal: null };
+    if (!ema20 || !ema50 || rsi === undefined) {
+      return { signal: null, reason: 'Indicators not fully calculated' };
+    }
 
-    // Active state entry: BUY if short EMA > long EMA, SELL if short EMA < long EMA
-    if (ema20 > ema50) {
-      return { signal: 'BUY', reason: `High-Frequency Scalper: EMA Short (${ema20.toFixed(2)}) > EMA Long (${ema50.toFixed(2)}) on 5m chart` };
+    const isBullish = ema20 > ema50;
+    const isBearish = ema20 < ema50;
+
+    if (isBullish) {
+      if (rsi >= stratSettings.rsiOverbought) {
+        return { signal: null, reason: `Scalp BUY ignored: RSI (${rsi.toFixed(1)}) is overbought (>= ${stratSettings.rsiOverbought})` };
+      }
+      const isPullback = current.close <= ema20 * 1.005;
+      if (!isPullback) {
+        return { signal: null, reason: `Scalp BUY ignored: Price is too extended above EMA20 ($${current.close.toFixed(2)} vs EMA20 $${ema20.toFixed(2)})` };
+      }
+
+      return {
+        signal: 'BUY',
+        reason: `HF Scalp Buy: EMA20 > EMA50 ($${ema20.toFixed(2)} > $${ema50.toFixed(2)}) and RSI is healthy at ${rsi.toFixed(1)}`
+      };
     }
-    if (ema20 < ema50) {
-      return { signal: 'SELL', reason: `High-Frequency Scalper: EMA Short (${ema20.toFixed(2)}) < EMA Long (${ema50.toFixed(2)}) on 5m chart` };
+
+    if (isBearish) {
+      if (rsi <= stratSettings.rsiOversold) {
+        return { signal: null, reason: `Scalp SELL ignored: RSI (${rsi.toFixed(1)}) is oversold (<= ${stratSettings.rsiOversold})` };
+      }
+      const isPullback = current.close >= ema20 * 0.995;
+      if (!isPullback) {
+        return { signal: null, reason: `Scalp SELL ignored: Price is too extended below EMA20 ($${current.close.toFixed(2)} vs EMA20 $${ema20.toFixed(2)})` };
+      }
+
+      return {
+        signal: 'SELL',
+        reason: `HF Scalp Sell: EMA20 < EMA50 ($${ema20.toFixed(2)} < $${ema50.toFixed(2)}) and RSI is healthy at ${rsi.toFixed(1)}`
+      };
     }
+
+    return { signal: null, reason: 'EMA20 and EMA50 are crossing or flat' };
+
   } else if (stratSettings.strategyType === 'MEAN_REVERSION') {
     const { bbLower, bbUpper, rsi } = current;
     const { bbLower: bbLowerPrev, bbUpper: bbUpperPrev } = previous;
     
-    if (!bbLower || !bbUpper || !bbLowerPrev || !bbUpperPrev || !rsi) return { signal: null };
+    if (!bbLower || !bbUpper || !bbLowerPrev || !bbUpperPrev || !rsi) {
+      return { signal: null, reason: 'Indicators not fully calculated' };
+    }
 
-    // Enforce 25/75 RSI boundaries and VWAP constraints
+    const adxThreshold = stratSettings.adxThreshold || 25;
+    const isMarketRanging = current.adx < adxThreshold;
+
     if ((current.close <= bbLower || previous.close <= bbLowerPrev) && rsi <= stratSettings.rsiOversold) {
       if (current.vwap && current.close <= current.vwap) {
-        return { signal: 'BUY', reason: `Mean Reversion Buy: BB rejection & RSI oversold (${rsi.toFixed(1)} <= ${stratSettings.rsiOversold}) below VWAP` };
+        if (isMarketRanging) {
+          return { signal: 'BUY', reason: `Mean Reversion Buy: BB rejection & RSI oversold (${rsi.toFixed(1)} <= ${stratSettings.rsiOversold}) below VWAP` };
+        } else {
+          return { signal: null, reason: `Mean Reversion Buy ignored: Trend is too strong. ADX is ${current.adx.toFixed(1)} (>= ${adxThreshold})` };
+        }
+      } else {
+        return { signal: null, reason: `Mean Reversion Buy ignored: Price is above VWAP ($${current.close.toFixed(2)} > $${current.vwap.toFixed(2)})` };
       }
     }
     if ((current.close >= bbUpper || previous.close >= bbUpperPrev) && rsi >= stratSettings.rsiOverbought) {
       if (current.vwap && current.close >= current.vwap) {
-        return { signal: 'SELL', reason: `Mean Reversion Sell: BB rejection & RSI overbought (${rsi.toFixed(1)} >= ${stratSettings.rsiOverbought}) above VWAP` };
+        if (isMarketRanging) {
+          return { signal: 'SELL', reason: `Mean Reversion Sell: BB rejection & RSI overbought (${rsi.toFixed(1)} >= ${stratSettings.rsiOverbought}) above VWAP` };
+        } else {
+          return { signal: null, reason: `Mean Reversion Sell ignored: Trend is too strong. ADX is ${current.adx.toFixed(1)} (>= ${adxThreshold})` };
+        }
+      } else {
+        return { signal: null, reason: `Mean Reversion Sell ignored: Price is below VWAP ($${current.close.toFixed(2)} < $${current.vwap.toFixed(2)})` };
       }
     }
+    return { signal: null, reason: 'Price is ranging within Bollinger Bands' };
+
   } else if (stratSettings.strategyType === 'MOMENTUM_BREAKOUT') {
     const lookback = 20;
-    if (len <= lookback) return { signal: null };
+    if (len <= lookback) return { signal: null, reason: 'Insufficient lookback data' };
 
     const slice = candlesList.slice(len - 1 - lookback, len - 1);
     let highestHigh = -Infinity;
@@ -616,21 +803,26 @@ function evaluateStrategyRules(candlesList, stratSettings) {
     
     const { atr, vwap } = current;
     const { atr: atrPrev } = previous;
-    if (!atr || !atrPrev) return { signal: null };
+    if (!atr || !atrPrev) return { signal: null, reason: 'ATR not fully calculated' };
 
     if (current.close > highestHigh && current.volume > avgVol * 1.3 && atr > atrPrev) {
       if (vwap && current.close > vwap) {
         return { signal: 'BUY', reason: 'High breakout with volume & ATR expansion above VWAP' };
+      } else {
+        return { signal: null, reason: 'Momentum Breakout Buy ignored: Price is below VWAP' };
       }
     }
     if (current.close < lowestLow && current.volume > avgVol * 1.3 && atr > atrPrev) {
       if (vwap && current.close < vwap) {
         return { signal: 'SELL', reason: 'Low breakout with volume & ATR expansion below VWAP' };
+      } else {
+        return { signal: null, reason: 'Momentum Breakout Sell ignored: Price is above VWAP' };
       }
     }
+    return { signal: null, reason: 'Price is consolidating within lookback high/low range' };
   }
 
-  return { signal: null };
+  return { signal: null, reason: 'Unknown strategy type' };
 }
 
 // --- Authentication Middleware ---
@@ -905,6 +1097,7 @@ app.get('/api/status', requireAuth, async (req, res) => {
     // Add settings
     stratSettings: session.stratSettings,
     riskSettings: session.riskSettings,
+    evaluationStates: session.evaluationStates || {},
   });
 });
 
@@ -978,6 +1171,7 @@ async function executeCloseOrder(session, symbol, reason, customSize = null) {
   const sizeToClose = customSize !== null ? customSize : pos.size;
   const tickerPrice = session.lastTickPrices[symbol] || pos.entryPrice;
 
+  const marketSymbol = getMarketSymbol(session, symbol);
   session.addLog(`Sending Close Order (${closeSide.toUpperCase()}) on Exchange for ${sizeToClose.toFixed(4)} ${symbol.split('/')[0]}...`, 'info');
 
   try {
@@ -985,9 +1179,9 @@ async function executeCloseOrder(session, symbol, reason, customSize = null) {
 
     if (session.exchangeInstance) {
       let finalCloseSize = sizeToClose;
-      if (session.exchangeInstance.markets && session.exchangeInstance.markets[symbol]) {
+      if (session.exchangeInstance.markets && session.exchangeInstance.markets[marketSymbol]) {
         try {
-          finalCloseSize = parseFloat(session.exchangeInstance.amountToPrecision(symbol, sizeToClose));
+          finalCloseSize = parseFloat(session.exchangeInstance.amountToPrecision(marketSymbol, sizeToClose));
         } catch (e) {
           finalCloseSize = parseFloat(sizeToClose.toFixed(4));
         }
@@ -1000,7 +1194,7 @@ async function executeCloseOrder(session, symbol, reason, customSize = null) {
       }
 
       // Place real market order on exchange to close
-      const order = await session.exchangeInstance.createMarketOrder(symbol, closeSide, finalCloseSize);
+      const order = await safeCreateMarketOrder(session.exchangeInstance, marketSymbol, closeSide, finalCloseSize, (txt, typ) => session.addLog(txt, typ));
       fillPrice = order.price || order.average || tickerPrice;
       session.addLog(`Exchange Fill success for ${symbol}. Closed size ${sizeToClose.toFixed(4)} at average price $${fillPrice}.`, 'success');
     } else {
@@ -1122,11 +1316,31 @@ setInterval(async () => {
 
       if (session.circuitBreakerTriggered || !session.botActive) continue;
 
+      // Fetch active exchange positions for safety sync to prevent double-entries
+      let exchangePositionsMap = {};
+      try {
+        if (session.exchangeInstance.has['fetchPositions']) {
+          const symbolsForFetch = session.activeSymbols.map(s => getMarketSymbol(session, s));
+          const positions = await session.exchangeInstance.fetchPositions(symbolsForFetch);
+          for (const p of positions) {
+            const baseSymbol = p.symbol.split(':')[0]; // e.g. BTC/USDT:USDT -> BTC/USDT
+            const side = p.side ? p.side.toUpperCase() : '';
+            const contracts = parseFloat(p.contracts || p.size || 0);
+            if (contracts > 0 && (side === 'LONG' || side === 'SHORT' || side === 'BUY' || side === 'SELL')) {
+              exchangePositionsMap[baseSymbol] = p;
+            }
+          }
+        }
+      } catch (posErr) {
+        console.error(`Failed to fetch exchange positions for ${session.username}:`, posErr.message);
+      }
+
       // 3. Process portfolio symbols sequentially (respect rate limits)
       for (const symbol of session.activeSymbols) {
         try {
+          const marketSymbol = getMarketSymbol(session, symbol);
           const timeframe = '5m';
-          const ohlcv = await session.exchangeInstance.fetchOHLCV(symbol, timeframe, undefined, 100);
+          const ohlcv = await session.exchangeInstance.fetchOHLCV(marketSymbol, timeframe, undefined, 100);
 
           const fetchedCandles = ohlcv.map((c) => ({
             time: c[0],
@@ -1143,9 +1357,71 @@ setInterval(async () => {
           const tickerPrice = latestCandle.close;
           session.lastTickPrices[symbol] = tickerPrice;
 
+          // Sync position state with the exchange
+          const exPos = exchangePositionsMap[symbol];
+          let pos = session.activePositions[symbol];
+
+          if (exPos) {
+            const posType = (exPos.side.toUpperCase() === 'LONG' || exPos.side.toUpperCase() === 'BUY') ? 'LONG' : 'SHORT';
+            const exSize = parseFloat(exPos.contracts || exPos.size || 0);
+
+            if (!pos || pos.type !== posType || Math.abs(pos.size - exSize) > 0.0001) {
+              pos = {
+                id: pos ? pos.id : `restored_${Date.now()}`,
+                type: posType,
+                symbol: symbol,
+                entryPrice: parseFloat(exPos.entryPrice || tickerPrice),
+                entryTime: pos ? pos.entryTime : Date.now(),
+                size: exSize,
+                leverage: parseFloat(exPos.leverage || 1),
+                stopLoss: pos ? pos.stopLoss : parseFloat((exPos.entryPrice * (posType === 'LONG' ? 0.95 : 1.05)).toFixed(2)),
+                takeProfit: pos ? pos.takeProfit : parseFloat((exPos.entryPrice * (posType === 'LONG' ? 1.10 : 0.90)).toFixed(2)),
+                target1Price: pos ? pos.target1Price : parseFloat((exPos.entryPrice * (posType === 'LONG' ? 1.075 : 0.925)).toFixed(2)),
+                halfClosed: pos ? pos.halfClosed : false,
+                pnl: parseFloat(exPos.unrealizedPnl || 0),
+                pnlPercent: parseFloat(exPos.percentage || 0),
+                status: 'OPEN',
+                maxObservedPrice: pos ? pos.maxObservedPrice : parseFloat(exPos.entryPrice || tickerPrice),
+                minObservedPrice: pos ? pos.minObservedPrice : parseFloat(exPos.entryPrice || tickerPrice),
+              };
+              session.activePositions[symbol] = pos;
+              session.addLog(`Synced active ${posType} position for ${symbol} from exchange (Size: ${exSize}).`, 'info');
+            }
+          } else {
+            if (pos) {
+              session.addLog(`Position for ${symbol} closed externally. Clearing local status.`, 'warning');
+              session.activePositions[symbol] = null;
+              pos = null;
+            }
+          }
+
+          // Initial evaluation state diagnostics template
+          const rsiVal = latestCandle.rsi;
+          const atrVal = latestCandle.atr;
+          const adxVal = latestCandle.adx;
+          const emaState = latestCandle.ema20 > latestCandle.ema50 ? 'EMA20 > EMA50 (Bullish)' : 'EMA20 < EMA50 (Bearish)';
+          const regime = adxVal >= (session.stratSettings.adxThreshold || 25) ? 'TRENDING' : 'RANGING/CHOP';
+
+          const evaluation = {
+            timestamp: Date.now(),
+            strategy: session.stratSettings.strategyType,
+            regime,
+            emaState,
+            rsi: rsiVal,
+            atr: atrVal,
+            adx: adxVal,
+            volume: latestCandle.volume,
+            status: 'WAITING_FOR_SIGNAL',
+            reason: 'Evaluating signal...',
+          };
+
           // Check active position updates
-          const pos = session.activePositions[symbol];
           if (pos) {
+            evaluation.status = 'POSITION_OPEN';
+            evaluation.reason = `Active ${pos.type} position is open (Size: ${pos.size.toFixed(4)}, Entry: $${pos.entryPrice.toFixed(2)})`;
+            session.evaluationStates[symbol] = evaluation;
+            logTickDetails(session.username, symbol, evaluation);
+
             // Update peak/valley
             if (pos.type === 'LONG') {
               pos.maxObservedPrice = Math.max(pos.maxObservedPrice || pos.entryPrice, tickerPrice);
@@ -1228,130 +1504,196 @@ setInterval(async () => {
               session.addLog(`Exit signal triggered for ${symbol}: Price ($${tickerPrice.toFixed(2)}) hit ${exitReason} limit (${exitReason === 'TP' ? pos.takeProfit.toFixed(2) : pos.stopLoss.toFixed(2)}). Closing...`, 'warning');
               await executeCloseOrder(session, symbol, exitReason);
             }
+
+            continue;
           }
 
           // Evaluate entries
           const openCount = Object.values(session.activePositions).filter(Boolean).length;
-          if (!pos && openCount < session.riskSettings.maxConcurrentPositions) {
-            // Check 3-candle cooldown (15 minutes on 5m candles, skipped for HF Scalper)
-            if (session.cooldowns[symbol]) {
-              const elapsed = Date.now() - session.cooldowns[symbol];
-              const isHighFreq = session.stratSettings.strategyType === 'HIGH_FREQUENCY_SCALPER';
-              const cooldownLimit = isHighFreq ? 5 * 60 * 1000 : 15 * 60 * 1000; // 5 minute cooldown for HF scalper, 15 minutes otherwise
-              if (elapsed < cooldownLimit) {
-                // Still in cooldown
-                continue;
-              }
+          if (openCount >= session.riskSettings.maxConcurrentPositions) {
+            evaluation.status = 'REJECTED';
+            evaluation.reason = `Max concurrent positions limit reached (${session.riskSettings.maxConcurrentPositions})`;
+            session.evaluationStates[symbol] = evaluation;
+            logTickDetails(session.username, symbol, evaluation);
+            continue;
+          }
+
+          // Check 3-candle cooldown (15 minutes on 5m candles, 5 minutes for HF Scalper)
+          if (session.cooldowns[symbol]) {
+            const elapsed = Date.now() - session.cooldowns[symbol];
+            const isHighFreq = session.stratSettings.strategyType === 'HIGH_FREQUENCY_SCALPER';
+            const cooldownLimit = isHighFreq ? 5 * 60 * 1000 : 15 * 60 * 1000;
+            if (elapsed < cooldownLimit) {
+              evaluation.status = 'COOLDOWN';
+              evaluation.reason = `In cooldown. Cooldown ends in ${Math.ceil((cooldownLimit - elapsed) / 1000)}s`;
+              session.evaluationStates[symbol] = evaluation;
+              logTickDetails(session.username, symbol, evaluation);
+              continue;
             }
+          }
 
-            const decision = evaluateStrategyRules(calculatedCandles, session.stratSettings);
+          const decision = evaluateStrategyRules(calculatedCandles, session.stratSettings);
 
-            if (decision.signal) {
-              let mtfAligned = true;
+          if (!decision.signal) {
+            evaluation.status = 'WAITING_FOR_SIGNAL';
+            evaluation.reason = decision.reason || 'No entry setup detected';
+            session.evaluationStates[symbol] = evaluation;
+            logTickDetails(session.username, symbol, evaluation);
+            continue;
+          }
 
-              // Check Multi-Timeframe Trend filter (using 1H for 5m strategy macro filter)
-              if (session.stratSettings.useMultiTimeframe) {
-                try {
-                  const ohlcvMacro = await session.exchangeInstance.fetchOHLCV(symbol, '1h', undefined, 50);
-                  const closesMacro = ohlcvMacro.map((c) => c[4]);
-                  const ema20_macro = calculateEMA(closesMacro, 20);
-                  const ema50_macro = calculateEMA(closesMacro, 50);
+          let mtfAligned = true;
 
-                  const last20_macro = ema20_macro[ema20_macro.length - 1];
-                  const last50_macro = ema50_macro[ema50_macro.length - 1];
+          // Check Multi-Timeframe Trend filter (using 1H for 5m strategy macro filter)
+          if (session.stratSettings.useMultiTimeframe) {
+            try {
+              const ohlcvMacro = await session.exchangeInstance.fetchOHLCV(marketSymbol, '1h', undefined, 50);
+              const closesMacro = ohlcvMacro.map((c) => c[4]);
+              const ema20_macro = calculateEMA(closesMacro, 20);
+              const ema50_macro = calculateEMA(closesMacro, 50);
 
-                  if (decision.signal === 'BUY' && last20_macro < last50_macro) {
-                    mtfAligned = false;
-                    session.addLog(`Ignored BUY for ${symbol}: 1H Macro trend is bearish (1H EMA20 < 1H EMA50)`, 'info');
-                  } else if (decision.signal === 'SELL' && last20_macro > last50_macro) {
-                    mtfAligned = false;
-                    session.addLog(`Ignored SELL for ${symbol}: 1H Macro trend is bullish (1H EMA20 > 1H EMA50)`, 'info');
-                  }
-                } catch (mtfErr) {
-                  session.addLog(`Failed to fetch 1H macro trend for ${symbol}: ${mtfErr.message}. Proceeding without filter.`, 'warning');
-                }
+              const last20_macro = ema20_macro[ema20_macro.length - 1];
+              const last50_macro = ema50_macro[ema50_macro.length - 1];
+
+              if (decision.signal === 'BUY' && last20_macro < last50_macro) {
+                mtfAligned = false;
+                evaluation.status = 'REJECTED';
+                evaluation.reason = `1H Macro Bearish mismatch (1H EMA20 < 1H EMA50)`;
+              } else if (decision.signal === 'SELL' && last20_macro > last50_macro) {
+                mtfAligned = false;
+                evaluation.status = 'REJECTED';
+                evaluation.reason = `1H Macro Bullish mismatch (1H EMA20 > 1H EMA50)`;
               }
-
-              if (mtfAligned) {
-                session.addLog(`Signal detected for ${symbol}: ${decision.signal} (${decision.reason})`, 'warning');
-
-                const atrValue = latestCandle.atr || (latestCandle.high - latestCandle.low) || 5.0;
-                const slDistance = atrValue * session.riskSettings.atrMultiplier;
-
-                let slPrice = 0;
-                let tpPrice = 0;
-                let target1Price = 0;
-
-                if (decision.signal === 'BUY') {
-                  slPrice = tickerPrice - slDistance;
-                  tpPrice = tickerPrice + slDistance * session.riskSettings.riskRewardRatio;
-                  target1Price = tickerPrice + slDistance * 1.5;
-                } else {
-                  slPrice = tickerPrice + slDistance;
-                  tpPrice = tickerPrice - slDistance * session.riskSettings.riskRewardRatio;
-                  target1Price = tickerPrice - slDistance * 1.5;
-                }
-
-                const maxLossUsd = exchangeBalance * (session.riskSettings.riskPercent / 100);
-                let size = maxLossUsd / slDistance;
-
-                // Adjust to minimum order value of 5 USDT to ensure Bybit executes it for small balances
-                let exposure = size * tickerPrice;
-                const minOrderValue = 5.0;
-                if (exposure < minOrderValue && exchangeBalance >= minOrderValue) {
-                  size = minOrderValue / tickerPrice;
-                  exposure = size * tickerPrice;
-                }
-
-                // Check exposure limits
-                const maxAllowed = exchangeBalance * session.riskSettings.leverage;
-                if (exposure > maxAllowed) {
-                  size = maxAllowed / tickerPrice;
-                }
-
-                // Round size to exchange precision
-                if (session.exchangeInstance && session.exchangeInstance.markets && session.exchangeInstance.markets[symbol]) {
-                  try {
-                    size = parseFloat(session.exchangeInstance.amountToPrecision(symbol, size));
-                  } catch (e) {
-                    size = parseFloat(size.toFixed(4));
-                  }
-                } else {
-                  size = parseFloat(size.toFixed(4));
-                }
-
-                if (size <= 0) {
-                  throw new Error(`Calculated size ${size} is too small to execute on exchange.`);
-                }
-
-                const tradeSide = decision.signal === 'BUY' ? 'buy' : 'sell';
-                session.addLog(`Sending Entry Order (${tradeSide.toUpperCase()}) for ${size} ${symbol} to Exchange...`, 'info');
-
-                const order = await session.exchangeInstance.createMarketOrder(symbol, tradeSide, size);
-                const fillPrice = order.price || order.average || tickerPrice;
-
-                session.activePositions[symbol] = {
-                  id: `live_${Date.now()}`,
-                  type: decision.signal === 'BUY' ? 'LONG' : 'SHORT',
-                  symbol: symbol,
-                  entryPrice: fillPrice,
-                  entryTime: Date.now(),
-                  size: size,
-                  leverage: session.riskSettings.leverage,
-                  stopLoss: parseFloat(slPrice.toFixed(2)),
-                  takeProfit: parseFloat(tpPrice.toFixed(2)),
-                  target1Price: parseFloat(target1Price.toFixed(2)),
-                  halfClosed: false,
-                  pnl: 0,
-                  pnlPercent: 0,
-                  status: 'OPEN',
-                  maxObservedPrice: fillPrice,
-                  minObservedPrice: fillPrice,
-                };
-
-                session.addLog(`📥 Executed live entry for ${symbol} at $${fillPrice}. SL: $${slPrice.toFixed(2)}, Target 1 (1.5R): $${target1Price.toFixed(2)}, Target 2 (${session.riskSettings.riskRewardRatio}R): $${tpPrice.toFixed(2)}`, 'success');
-              }
+            } catch (mtfErr) {
+              session.addLog(`Failed to fetch 1H macro trend for ${symbol}: ${mtfErr.message}. Proceeding without filter.`, 'warning');
             }
+          }
+
+          if (!mtfAligned) {
+            session.evaluationStates[symbol] = evaluation;
+            logTickDetails(session.username, symbol, evaluation);
+            continue;
+          }
+
+          session.addLog(`Signal detected for ${symbol}: ${decision.signal} (${decision.reason})`, 'warning');
+
+          const atrValue = latestCandle.atr || (latestCandle.high - latestCandle.low) || 5.0;
+          const slDistance = atrValue * session.riskSettings.atrMultiplier;
+
+          let slPrice = 0;
+          let tpPrice = 0;
+          let target1Price = 0;
+
+          if (decision.signal === 'BUY') {
+            slPrice = tickerPrice - slDistance;
+            tpPrice = tickerPrice + slDistance * session.riskSettings.riskRewardRatio;
+            target1Price = tickerPrice + slDistance * 1.5;
+          } else {
+            slPrice = tickerPrice + slDistance;
+            tpPrice = tickerPrice - slDistance * session.riskSettings.riskRewardRatio;
+            target1Price = tickerPrice - slDistance * 1.5;
+          }
+
+          const maxLossUsd = exchangeBalance * (session.riskSettings.riskPercent / 100);
+          let size = maxLossUsd / slDistance;
+
+          // Fetch min order size limits (safely scales up small balances to Bybit's 5 USDT cost)
+          const minSize = getMinOrderSize(session, marketSymbol, tickerPrice);
+          evaluation.minNotional = minSize * tickerPrice;
+
+          if (size < minSize) {
+            const requiredCost = minSize * tickerPrice;
+            if (exchangeBalance >= requiredCost) {
+              size = minSize;
+              session.addLog(`Position scaled up to exchange minimum: ${size.toFixed(4)} ($${requiredCost.toFixed(2)} USDT)`, 'info');
+            } else {
+              evaluation.status = 'REJECTED';
+              evaluation.reason = `Size cost $${(size * tickerPrice).toFixed(2)} < required min $${requiredCost.toFixed(2)} and balance $${exchangeBalance.toFixed(2)} is insufficient.`;
+              session.evaluationStates[symbol] = evaluation;
+              logTickDetails(session.username, symbol, evaluation);
+              continue;
+            }
+          }
+
+          let exposure = size * tickerPrice;
+
+          // Check exposure limits (based on leverage)
+          const maxAllowed = exchangeBalance * session.riskSettings.leverage;
+          if (exposure > maxAllowed) {
+            size = maxAllowed / tickerPrice;
+            exposure = size * tickerPrice;
+          }
+
+          // Round size to exchange precision
+          if (session.exchangeInstance && session.exchangeInstance.markets && session.exchangeInstance.markets[marketSymbol]) {
+            try {
+              size = parseFloat(session.exchangeInstance.amountToPrecision(marketSymbol, size));
+            } catch (e) {
+              size = parseFloat(size.toFixed(4));
+            }
+          } else {
+            size = parseFloat(size.toFixed(4));
+          }
+
+          if (size <= 0) {
+            evaluation.status = 'REJECTED';
+            evaluation.reason = `Precision rounding reduced size to 0. Cannot execute.`;
+            session.evaluationStates[symbol] = evaluation;
+            logTickDetails(session.username, symbol, evaluation);
+            continue;
+          }
+
+          const tradeSide = decision.signal === 'BUY' ? 'buy' : 'sell';
+          const payload = {
+            symbol: marketSymbol,
+            side: tradeSide,
+            size: size
+          };
+
+          evaluation.calculatedSize = size;
+          evaluation.payload = payload;
+          evaluation.status = 'EXECUTING';
+          evaluation.reason = `Sending ${tradeSide.toUpperCase()} entry order (Size: ${size})`;
+          session.evaluationStates[symbol] = evaluation;
+          logTickDetails(session.username, symbol, evaluation);
+
+          try {
+            // Place entry order with retries
+            const order = await safeCreateMarketOrder(session.exchangeInstance, marketSymbol, tradeSide, size, (txt, typ) => session.addLog(txt, typ));
+            const fillPrice = order.price || order.average || tickerPrice;
+
+            session.activePositions[symbol] = {
+              id: `live_${Date.now()}`,
+              type: decision.signal === 'BUY' ? 'LONG' : 'SHORT',
+              symbol: symbol,
+              entryPrice: fillPrice,
+              entryTime: Date.now(),
+              size: size,
+              leverage: session.riskSettings.leverage,
+              stopLoss: parseFloat(slPrice.toFixed(2)),
+              takeProfit: parseFloat(tpPrice.toFixed(2)),
+              target1Price: parseFloat(target1Price.toFixed(2)),
+              halfClosed: false,
+              pnl: 0,
+              pnlPercent: 0,
+              status: 'OPEN',
+              maxObservedPrice: fillPrice,
+              minObservedPrice: fillPrice,
+            };
+
+            evaluation.status = 'POSITION_OPEN';
+            evaluation.reason = `Executed entry for ${symbol} at $${fillPrice}`;
+            session.evaluationStates[symbol] = evaluation;
+            logTickDetails(session.username, symbol, evaluation);
+
+            session.addLog(`📥 Executed live entry for ${symbol} at $${fillPrice}. SL: $${slPrice.toFixed(2)}, Target 1 (1.5R): $${target1Price.toFixed(2)}, Target 2 (${session.riskSettings.riskRewardRatio}R): $${tpPrice.toFixed(2)}`, 'success');
+          } catch (orderErr) {
+            evaluation.status = 'ERROR';
+            evaluation.reason = `Exchange entry failed: ${orderErr.message}`;
+            evaluation.error = orderErr.message;
+            session.evaluationStates[symbol] = evaluation;
+            logTickDetails(session.username, symbol, evaluation);
+            session.addLog(`Order execution failed for ${symbol}: ${orderErr.message}`, 'danger');
           }
 
           await sleep(500); // Prevent API rate limits
