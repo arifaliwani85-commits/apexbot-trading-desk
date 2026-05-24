@@ -124,18 +124,38 @@ if (!fs.existsSync(DB_DIR)) {
 }
 
 function getUserPath(username) {
-  const safeName = username.replace(/[^a-zA-Z0-9_-]/g, '');
-  return path.join(DB_DIR, `${safeName}.json`);
+  const hash = crypto.createHash('sha256').update(username.toLowerCase()).digest('hex');
+  return path.join(DB_DIR, `${hash}.json`);
 }
 
 function saveUserProfile(profile) {
   const userPath = getUserPath(profile.username);
   fs.writeFileSync(userPath, JSON.stringify(profile, null, 2));
+
+  // Migrate old regex-based profiles if they exist
+  try {
+    const safeName = profile.username.replace(/[^a-zA-Z0-9_-]/g, '');
+    const oldPath = path.join(DB_DIR, `${safeName}.json`);
+    if (oldPath !== userPath && fs.existsSync(oldPath)) {
+      fs.unlinkSync(oldPath);
+    }
+  } catch (e) {
+    console.error('Failed to cleanup migrated user profile:', e);
+  }
 }
 
 function loadUserProfile(username) {
-  const userPath = getUserPath(username);
-  if (!fs.existsSync(userPath)) return null;
+  let userPath = getUserPath(username);
+  if (!fs.existsSync(userPath)) {
+    // Fallback to check old regex-based filename format
+    const safeName = username.replace(/[^a-zA-Z0-9_-]/g, '');
+    const oldPath = path.join(DB_DIR, `${safeName}.json`);
+    if (fs.existsSync(oldPath)) {
+      userPath = oldPath;
+    } else {
+      return null;
+    }
+  }
   try {
     return JSON.parse(fs.readFileSync(userPath, 'utf8'));
   } catch (e) {
@@ -256,11 +276,15 @@ function initAllActiveSessions() {
     let loadedCount = 0;
     for (const file of files) {
       if (file.endsWith('.json')) {
-        const username = file.replace('.json', '');
-        const profile = loadUserProfile(username);
-        if (profile && profile.botActive) {
-          getOrCreateSession(username);
-          loadedCount++;
+        const filePath = path.join(DB_DIR, file);
+        try {
+          const profile = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+          if (profile && profile.botActive && profile.username) {
+            getOrCreateSession(profile.username);
+            loadedCount++;
+          }
+        } catch (e) {
+          console.error(`Failed to parse user profile: ${file}`, e);
         }
       }
     }
@@ -859,12 +883,17 @@ function requireAuth(req, res, next) {
 app.post('/api/auth/register', (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) {
-    return res.status(400).json({ success: false, error: 'Username and password are required.' });
+    return res.status(400).json({ success: false, error: 'Email/Username and password are required.' });
   }
 
-  const sanitized = username.replace(/[^a-zA-Z0-9_-]/g, '');
-  if (sanitized !== username || username.length < 3) {
-    return res.status(400).json({ success: false, error: 'Username must be at least 3 characters and contain only letters, numbers, hyphens, and underscores.' });
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  const usernameRegex = /^[a-zA-Z0-9_-]{3,50}$/;
+
+  const isValidEmail = emailRegex.test(username);
+  const isValidUsername = usernameRegex.test(username);
+
+  if (!isValidEmail && !isValidUsername) {
+    return res.status(400).json({ success: false, error: 'Please enter a valid email address or username.' });
   }
 
   const userPath = getUserPath(username);

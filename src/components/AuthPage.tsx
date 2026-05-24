@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Shield, User, Lock, ArrowRight, TrendingUp } from 'lucide-react';
+import { Shield, Mail, Lock, ArrowRight, TrendingUp } from 'lucide-react';
 
 interface AuthPageProps {
   onLoginSuccess: (token: string, username: string) => void;
@@ -227,13 +227,13 @@ export const AuthPage: React.FC<AuthPageProps> = ({ onLoginSuccess }) => {
         <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
           <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
             <label style={{ fontSize: '11px', textTransform: 'uppercase', letterSpacing: '0.05em', color: 'var(--text-secondary)', fontWeight: 600 }}>
-              Username
+              Email Address
             </label>
             <div style={{ position: 'relative', display: 'flex', alignItems: 'center' }}>
-              <User size={16} style={{ position: 'absolute', left: '12px', color: 'var(--text-secondary)' }} />
+              <Mail size={16} style={{ position: 'absolute', left: '12px', color: 'var(--text-secondary)' }} />
               <input
-                type="text"
-                placeholder="Enter username"
+                type="email"
+                placeholder="Enter email address"
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
                 style={{
