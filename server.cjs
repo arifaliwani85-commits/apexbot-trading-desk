@@ -649,21 +649,21 @@ function evaluateStrategyRules(candlesList, stratSettings) {
     }
 
     // 1. ADX Trend filter (avoid sideways chop)
-    const adxThreshold = stratSettings.adxThreshold !== undefined ? stratSettings.adxThreshold : 25;
+    const adxThreshold = stratSettings.adxThreshold !== undefined ? stratSettings.adxThreshold : 20;
     if (adx < adxThreshold) {
       return { signal: null, reason: `ADX (${adx.toFixed(1)}) is below threshold (${adxThreshold}) - ranging/choppy market` };
     }
 
-    // 2. Volume filter (avoid low volume chop)
+    // 2. Volume filter (avoid low volume chop - check last closed candle)
     const lookback = 20;
-    if (len >= lookback) {
+    if (len >= lookback + 1) {
       let totalVol = 0;
-      for (let i = len - 1 - lookback; i < len - 1; i++) {
+      for (let i = len - 2 - lookback; i < len - 2; i++) {
         totalVol += candlesList[i].volume || 1;
       }
       const avgVol = totalVol / lookback;
-      if (current.volume < avgVol * 0.8) {
-        return { signal: null, reason: `Low volume: current candle volume (${current.volume.toFixed(0)}) < 80% of average (${(avgVol * 0.8).toFixed(0)})` };
+      if (previous.volume < avgVol * 0.8) {
+        return { signal: null, reason: `Low volume on last closed candle: volume (${previous.volume.toFixed(0)}) < 80% of average (${(avgVol * 0.8).toFixed(0)})` };
       }
     }
 
@@ -676,13 +676,13 @@ function evaluateStrategyRules(candlesList, stratSettings) {
       if (rsi >= stratSettings.rsiOverbought) {
         return { signal: null, reason: `RSI (${rsi.toFixed(1)}) is overbought (>= ${stratSettings.rsiOverbought})` };
       }
-      // Pullback check: close is near EMA20 (within 0.3% of EMA20) to avoid buying the top
-      const isPullback = current.close <= ema20 * 1.003;
+      // Pullback check: close is near EMA20 (within 0.8% of EMA20) to avoid buying the top
+      const isPullback = current.close <= ema20 * 1.008;
       if (!isPullback) {
         return { signal: null, reason: `Price ($${current.close.toFixed(2)}) is too extended above EMA20 ($${ema20.toFixed(2)})` };
       }
       // Proximity to VWAP
-      if (current.vwap && current.close > current.vwap * 1.005) {
+      if (current.vwap && current.close > current.vwap * 1.015) {
         return { signal: null, reason: `Price ($${current.close.toFixed(2)}) is too extended above VWAP ($${current.vwap.toFixed(2)})` };
       }
 
@@ -697,13 +697,13 @@ function evaluateStrategyRules(candlesList, stratSettings) {
       if (rsi <= stratSettings.rsiOversold) {
         return { signal: null, reason: `RSI (${rsi.toFixed(1)}) is oversold (<= ${stratSettings.rsiOversold})` };
       }
-      // Pullback check: close is near EMA20 (within 0.3% of EMA20) to avoid selling the bottom
-      const isPullback = current.close >= ema20 * 0.997;
+      // Pullback check: close is near EMA20 (within 0.8% of EMA20) to avoid selling the bottom
+      const isPullback = current.close >= ema20 * 0.992;
       if (!isPullback) {
         return { signal: null, reason: `Price ($${current.close.toFixed(2)}) is too extended below EMA20 ($${ema20.toFixed(2)})` };
       }
       // Proximity to VWAP
-      if (current.vwap && current.close < current.vwap * 0.995) {
+      if (current.vwap && current.close < current.vwap * 0.985) {
         return { signal: null, reason: `Price ($${current.close.toFixed(2)}) is too extended below VWAP ($${current.vwap.toFixed(2)})` };
       }
 
@@ -729,7 +729,7 @@ function evaluateStrategyRules(candlesList, stratSettings) {
       if (rsi >= stratSettings.rsiOverbought) {
         return { signal: null, reason: `Scalp BUY ignored: RSI (${rsi.toFixed(1)}) is overbought (>= ${stratSettings.rsiOverbought})` };
       }
-      const isPullback = current.close <= ema20 * 1.005;
+      const isPullback = current.close <= ema20 * 1.01;
       if (!isPullback) {
         return { signal: null, reason: `Scalp BUY ignored: Price is too extended above EMA20 ($${current.close.toFixed(2)} vs EMA20 $${ema20.toFixed(2)})` };
       }
@@ -744,7 +744,7 @@ function evaluateStrategyRules(candlesList, stratSettings) {
       if (rsi <= stratSettings.rsiOversold) {
         return { signal: null, reason: `Scalp SELL ignored: RSI (${rsi.toFixed(1)}) is oversold (<= ${stratSettings.rsiOversold})` };
       }
-      const isPullback = current.close >= ema20 * 0.995;
+      const isPullback = current.close >= ema20 * 0.99;
       if (!isPullback) {
         return { signal: null, reason: `Scalp SELL ignored: Price is too extended below EMA20 ($${current.close.toFixed(2)} vs EMA20 $${ema20.toFixed(2)})` };
       }

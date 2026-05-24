@@ -37,7 +37,7 @@ function checkTrendFollowing(
 ): SignalResult {
   const { ema20, ema50, ema200, rsi, adx, vwap } = current;
 
-  const threshold = settings.adxThreshold !== undefined ? settings.adxThreshold : 25;
+  const threshold = settings.adxThreshold !== undefined ? settings.adxThreshold : 20;
 
   if (
     ema20 === undefined ||
@@ -55,17 +55,18 @@ function checkTrendFollowing(
     return { signal: null, reason: `ADX (${adx.toFixed(1)}) is below threshold (${threshold}) - choppy sideways market` };
   }
 
-  // 2. Volume check (avoid low volume chop)
+  // 2. Volume check (avoid low volume chop - check last closed candle)
   const len = candles.length;
   const lookback = 20;
-  if (len >= lookback) {
+  if (len >= lookback + 1) {
+    const previous = candles[len - 2];
     let totalVol = 0;
-    for (let i = len - 1 - lookback; i < len - 1; i++) {
+    for (let i = len - 2 - lookback; i < len - 2; i++) {
       totalVol += candles[i].volume || 1;
     }
     const avgVol = totalVol / lookback;
-    if (current.volume < avgVol * 0.8) {
-      return { signal: null, reason: `Low volume: current candle volume (${current.volume.toFixed(0)}) < 80% of average (${(avgVol * 0.8).toFixed(0)})` };
+    if (previous.volume < avgVol * 0.8) {
+      return { signal: null, reason: `Low volume on last closed candle: volume (${previous.volume.toFixed(0)}) < 80% of average (${(avgVol * 0.8).toFixed(0)})` };
     }
   }
 
@@ -77,11 +78,11 @@ function checkTrendFollowing(
     if (rsi >= settings.rsiOverbought) {
       return { signal: null, reason: `Uptrend BUY ignored: RSI (${rsi.toFixed(1)}) is overbought (>= ${settings.rsiOverbought})` };
     }
-    const isPullback = current.close <= ema20 * 1.003;
+    const isPullback = current.close <= ema20 * 1.008;
     if (!isPullback) {
       return { signal: null, reason: `Uptrend BUY ignored: Price is too extended above EMA20 ($${current.close.toFixed(2)} vs EMA20 $${ema20.toFixed(2)})` };
     }
-    if (current.close > vwap * 1.005) {
+    if (current.close > vwap * 1.015) {
       return { signal: null, reason: `Uptrend BUY ignored: Price is too extended above VWAP ($${current.close.toFixed(2)} vs VWAP $${vwap.toFixed(2)})` };
     }
 
@@ -95,11 +96,11 @@ function checkTrendFollowing(
     if (rsi <= settings.rsiOversold) {
       return { signal: null, reason: `Downtrend SELL ignored: RSI (${rsi.toFixed(1)}) is oversold (<= ${settings.rsiOversold})` };
     }
-    const isPullback = current.close >= ema20 * 0.997;
+    const isPullback = current.close >= ema20 * 0.992;
     if (!isPullback) {
       return { signal: null, reason: `Downtrend SELL ignored: Price is too extended below EMA20 ($${current.close.toFixed(2)} vs EMA20 $${ema20.toFixed(2)})` };
     }
-    if (current.close < vwap * 0.995) {
+    if (current.close < vwap * 0.985) {
       return { signal: null, reason: `Downtrend SELL ignored: Price is too extended below VWAP ($${current.close.toFixed(2)} vs VWAP $${vwap.toFixed(2)})` };
     }
 
@@ -288,7 +289,7 @@ function checkHighFrequencyScalper(
     if (rsi >= settings.rsiOverbought) {
       return { signal: null, reason: `Scalp BUY ignored: RSI (${rsi.toFixed(1)}) is overbought (>= ${settings.rsiOverbought})` };
     }
-    const isPullback = current.close <= ema20 * 1.005;
+    const isPullback = current.close <= ema20 * 1.01;
     if (!isPullback) {
       return { signal: null, reason: `Scalp BUY ignored: Price is too extended above EMA20 ($${current.close.toFixed(2)} vs EMA20 $${ema20.toFixed(2)})` };
     }
@@ -303,7 +304,7 @@ function checkHighFrequencyScalper(
     if (rsi <= settings.rsiOversold) {
       return { signal: null, reason: `Scalp SELL ignored: RSI (${rsi.toFixed(1)}) is oversold (<= ${settings.rsiOversold})` };
     }
-    const isPullback = current.close >= ema20 * 0.995;
+    const isPullback = current.close >= ema20 * 0.99;
     if (!isPullback) {
       return { signal: null, reason: `Scalp SELL ignored: Price is too extended below EMA20 ($${current.close.toFixed(2)} vs EMA20 $${ema20.toFixed(2)})` };
     }
