@@ -167,7 +167,7 @@ function getOrCreateSession(username) {
     },
     botActive: profile.botActive || false,
     currentSymbol: profile.currentSymbol || 'BTC/USDT',
-    activeSymbols: profile.activeSymbols || ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'DOGE/USDT', 'ALGO/USDT', 'ADA/USDT'],
+    activeSymbols: profile.activeSymbols || ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'DOGE/USDT', 'ALGO/USDT', 'ADA/USDT', 'XRP/USDT', 'LTC/USDT', 'LINK/USDT', 'DOT/USDT', 'AVAX/USDT'],
     activePositions: {},
     closedTrades: profile.closedTrades || [],
     botLogs: [],
@@ -683,7 +683,7 @@ app.post('/api/auth/register', (req, res) => {
     encryptedExchangeConfig: '',
     botActive: false,
     currentSymbol: 'BTC/USDT',
-    activeSymbols: ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'DOGE/USDT', 'ALGO/USDT', 'ADA/USDT'],
+    activeSymbols: ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'DOGE/USDT', 'ALGO/USDT', 'ADA/USDT', 'XRP/USDT', 'LTC/USDT', 'LINK/USDT', 'DOT/USDT', 'AVAX/USDT'],
     closedTrades: [],
     stratSettings: {
       strategyType: 'TREND_FOLLOWING',
