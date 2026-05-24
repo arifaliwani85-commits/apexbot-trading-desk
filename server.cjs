@@ -3,6 +3,29 @@ const cors = require('cors');
 const dotenv = require('dotenv');
 const fs = require('fs');
 const path = require('path');
+
+// Global Error Logger for Hostinger Diagnostics
+process.on('uncaughtException', (err) => {
+  const logMsg = `[${new Date().toISOString()}] UNCAUGHT EXCEPTION: ${err.stack || err}\n`;
+  try {
+    fs.appendFileSync(path.join(__dirname, 'crash.log'), logMsg);
+  } catch (e) {
+    console.error('Failed to write to crash.log:', e);
+  }
+  console.error(logMsg);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  const logMsg = `[${new Date().toISOString()}] UNHANDLED REJECTION: ${reason}\n`;
+  try {
+    fs.appendFileSync(path.join(__dirname, 'crash.log'), logMsg);
+  } catch (e) {
+    console.error('Failed to write to crash.log:', e);
+  }
+  console.error(logMsg);
+});
+
 const ccxt = require('ccxt');
 
 // Load environment variables
