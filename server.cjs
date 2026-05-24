@@ -316,15 +316,15 @@ function getMinOrderSize(session, marketSymbol, price) {
   return Math.max(minAmount, sizeFromCost);
 }
 
-async function safeCreateMarketOrder(exchangeInstance, symbol, side, amount, addLog) {
+async function safeCreateMarketOrder(exchangeInstance, symbol, side, amount, params = {}, addLog) {
   let attempts = 3;
   let delay = 1000;
   const ccxtLib = getCcxt();
 
   for (let i = 1; i <= attempts; i++) {
     try {
-      addLog(`Sending Market Order to Exchange (Attempt ${i}/${attempts}): ${side.toUpperCase()} ${amount} ${symbol}`, 'info');
-      const order = await exchangeInstance.createMarketOrder(symbol, side, amount);
+      addLog(`Sending Market Order to Exchange (Attempt ${i}/${attempts}): ${side.toUpperCase()} ${amount} ${symbol} (params: ${JSON.stringify(params)})`, 'info');
+      const order = await exchangeInstance.createMarketOrder(symbol, side, amount, params);
       return order;
     } catch (err) {
       const isTransient = (ccxtLib.NetworkError && err instanceof ccxtLib.NetworkError) ||
@@ -1201,8 +1201,9 @@ async function executeCloseOrder(session, symbol, reason, customSize = null) {
         finalCloseSize = sizeToClose;
       }
 
+      const closeParams = session.isHedgeMode ? { positionIdx: pos.type === 'LONG' ? 1 : 2 } : { positionIdx: 0 };
       // Place real market order on exchange to close
-      const order = await safeCreateMarketOrder(session.exchangeInstance, marketSymbol, closeSide, finalCloseSize, (txt, typ) => session.addLog(txt, typ));
+      const order = await safeCreateMarketOrder(session.exchangeInstance, marketSymbol, closeSide, finalCloseSize, closeParams, (txt, typ) => session.addLog(txt, typ));
       fillPrice = order.price || order.average || tickerPrice;
       session.addLog(`Exchange Fill success for ${symbol}. Closed size ${sizeToClose.toFixed(4)} at average price $${fillPrice}.`, 'success');
     } else {
@@ -1251,6 +1252,10 @@ async function executeCloseOrder(session, symbol, reason, customSize = null) {
       session.addLog(summaryMsg, pnl >= 0 ? 'success' : 'danger');
     }
   } catch (err) {
+    if (err.message.includes('position idx not match position mode') || err.message.includes('10001')) {
+      session.isHedgeMode = !session.isHedgeMode;
+      session.addLog(`Close order failed due to position mode mismatch. Automatically switched Hedge Mode setting to: ${session.isHedgeMode}.`, 'warning');
+    }
     session.addLog(`Failed to close position on exchange for ${symbol}: ${err.message}`, 'danger');
     throw err;
   }
@@ -1330,11 +1335,19 @@ setInterval(async () => {
 
       // Fetch active exchange positions for safety sync to prevent double-entries
       let exchangePositionsMap = {};
+      let isHedgeMode = false;
       try {
         if (session.exchangeInstance.has['fetchPositions']) {
           const symbolsForFetch = symbolsToProcess.map(s => getMarketSymbol(session, s));
           const positions = await session.exchangeInstance.fetchPositions(symbolsForFetch);
           for (const p of positions) {
+            // Check position index to determine Hedge Mode dynamically
+            const rawIdx = p.positionIdx !== undefined ? p.positionIdx : (p.info ? (p.info.positionIdx || p.info.position_idx) : undefined);
+            const pIdx = parseInt(rawIdx);
+            if (pIdx === 1 || pIdx === 2) {
+              isHedgeMode = true;
+            }
+
             const baseSymbol = p.symbol.split(':')[0]; // e.g. BTC/USDT:USDT -> BTC/USDT
             const side = p.side ? p.side.toUpperCase() : '';
             const contracts = parseFloat(p.contracts || p.size || 0);
@@ -1346,6 +1359,7 @@ setInterval(async () => {
       } catch (posErr) {
         console.error(`Failed to fetch exchange positions for ${session.username}:`, posErr.message);
       }
+      session.isHedgeMode = isHedgeMode;
 
       // 3. Process the active/selected symbol and open positions sequentially (respect rate limits)
       for (const symbol of symbolsToProcess) {
@@ -1669,9 +1683,10 @@ setInterval(async () => {
           session.evaluationStates[symbol] = evaluation;
           logTickDetails(session.username, symbol, evaluation);
 
+          const entryParams = session.isHedgeMode ? { positionIdx: decision.signal === 'BUY' ? 1 : 2 } : { positionIdx: 0 };
           try {
             // Place entry order with retries
-            const order = await safeCreateMarketOrder(session.exchangeInstance, marketSymbol, tradeSide, size, (txt, typ) => session.addLog(txt, typ));
+            const order = await safeCreateMarketOrder(session.exchangeInstance, marketSymbol, tradeSide, size, entryParams, (txt, typ) => session.addLog(txt, typ));
             const fillPrice = order.price || order.average || tickerPrice;
 
             session.activePositions[symbol] = {
@@ -1700,6 +1715,10 @@ setInterval(async () => {
 
             session.addLog(`📥 Executed live entry for ${symbol} at $${fillPrice}. SL: $${slPrice.toFixed(2)}, Target 1 (1.5R): $${target1Price.toFixed(2)}, Target 2 (${session.riskSettings.riskRewardRatio}R): $${tpPrice.toFixed(2)}`, 'success');
           } catch (orderErr) {
+            if (orderErr.message.includes('position idx not match position mode') || orderErr.message.includes('10001')) {
+              session.isHedgeMode = !session.isHedgeMode;
+              session.addLog(`Order failed due to position mode mismatch. Automatically switched Hedge Mode setting to: ${session.isHedgeMode}. Retrying will occur on next signal tick.`, 'warning');
+            }
             evaluation.status = 'ERROR';
             evaluation.reason = `Exchange entry failed: ${orderErr.message}`;
             evaluation.error = orderErr.message;
