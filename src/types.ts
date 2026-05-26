@@ -46,7 +46,7 @@ export interface Position {
   target1Price?: number;     // partial take profit level
 }
 
-export type StrategyType = 'TREND_FOLLOWING' | 'MEAN_REVERSION' | 'MOMENTUM_BREAKOUT' | 'HIGH_FREQUENCY_SCALPER';
+export type StrategyType = 'TREND_FOLLOWING' | 'MEAN_REVERSION' | 'MOMENTUM_BREAKOUT' | 'HIGH_FREQUENCY_SCALPER' | 'NEWS_SENTIMENT_TRADING';
 
 export interface StrategySettings {
   strategyType: StrategyType;

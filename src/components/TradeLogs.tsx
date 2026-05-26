@@ -410,6 +410,37 @@ export const TradeLogs: React.FC<TradeLogsProps> = ({
                           </div>
                         )}
                       </div>
+
+                      {/* News Sentiment metrics */}
+                      {evalState.newsSentiment !== undefined && (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', fontSize: '10px', borderTop: '1px solid var(--border-color)', paddingTop: '6px', marginTop: '4px' }}>
+                          <div style={{ display: 'flex', justifyContent: 'space-between', fontFamily: 'var(--font-mono)' }}>
+                            <span>
+                              <span style={{ color: 'var(--text-muted)' }}>News: </span>
+                              <span style={{
+                                fontWeight: 'bold',
+                                color: evalState.newsSentiment >= 1.5 ? 'var(--accent-green)' : evalState.newsSentiment <= -1.5 ? 'var(--accent-red)' : 'var(--text-primary)'
+                              }}>
+                                {evalState.newsSentiment > 0 ? '+' : ''}{evalState.newsSentiment.toFixed(2)}
+                              </span>
+                            </span>
+                            <span>
+                              <span style={{ color: 'var(--text-muted)' }}>Whales: </span>
+                              <span style={{
+                                fontWeight: 'bold',
+                                color: evalState.whaleImbalance > 0 ? 'var(--accent-green)' : evalState.whaleImbalance < 0 ? 'var(--accent-red)' : 'var(--text-primary)'
+                              }}>
+                                {evalState.whaleImbalance > 0 ? '+' : ''}{evalState.whaleImbalance.toFixed(2)}
+                              </span>
+                            </span>
+                          </div>
+                          {evalState.latestStory && (
+                            <div style={{ fontSize: '9px', color: 'var(--text-secondary)', fontStyle: 'italic', textOverflow: 'ellipsis', overflow: 'hidden', whiteSpace: 'nowrap', maxWidth: '280px' }} title={evalState.latestStory}>
+                              📰 {evalState.latestStory}
+                            </div>
+                          )}
+                        </div>
+                      )}
                     </div>
                   );
                 })}

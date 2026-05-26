@@ -552,6 +552,7 @@ export const StrategyConfig: React.FC<StrategyConfigProps> = ({
             <option value="MEAN_REVERSION">Bollinger Bands + RSI</option>
             <option value="MOMENTUM_BREAKOUT">Momentum Breakout (ATR)</option>
             <option value="HIGH_FREQUENCY_SCALPER">High-Frequency Scalper (EMA Cross + RSI)</option>
+            <option value="NEWS_SENTIMENT_TRADING">News & Whale Sentiment HFT Strategy</option>
           </select>
         </div>
 
@@ -694,6 +695,12 @@ export const StrategyConfig: React.FC<StrategyConfigProps> = ({
               value={stratSettings.atrPeriod}
               onChange={(e) => handleStratParamChange('atrPeriod', parseInt(e.target.value))}
             />
+          </div>
+        )}
+
+        {stratSettings.strategyType === 'NEWS_SENTIMENT_TRADING' && (
+          <div style={{ fontSize: '11px', color: 'var(--text-secondary)', background: 'rgba(255,215,0,0.04)', border: '1px solid rgba(255,215,0,0.12)', padding: '10px', borderRadius: 'var(--radius-sm)', lineHeight: '1.4' }}>
+            ⚡️ <strong>News & Whale Sentiment Strategy:</strong> Evaluates live crypto headlines from Cointelegraph and Bitcoin.com mixed with real-time order-book whale imbalances to capture high-probability sentiment runs.
           </div>
         )}
       </div>

@@ -155,6 +155,7 @@ export default function App() {
   const tickCountRef = useRef(0);
   const simIntervalRef = useRef<any>(null);
   const lastExitTimeRef = useRef<number | null>(null);
+  const seenPositionIdsRef = useRef<string[]>([]);
 
   // Add a log message helper
   const addLog = (text: string, type: LogMessage['type'] = 'info') => {
@@ -209,6 +210,18 @@ export default function App() {
           });
           setBotActive(data.botActive);
           setAllPositions(data.allPositions || []);
+
+          // Detect new positions opened to auto-switch chart
+          if (data.allPositions) {
+            const currentOpenPositions = data.allPositions.filter((pos: any) => pos.status === 'OPEN');
+            const newOpenPosition = currentOpenPositions.find((pos: any) => !seenPositionIdsRef.current.includes(pos.id));
+            if (newOpenPosition) {
+              const baseSymbol = newOpenPosition.symbol.split(':')[0];
+              setViewedSymbol(baseSymbol);
+            }
+            // Update the ref to the current list of open position IDs
+            seenPositionIdsRef.current = currentOpenPositions.map((pos: any) => pos.id);
+          }
           if (data.evaluationStates) {
             setEvaluationStates(data.evaluationStates);
           }
