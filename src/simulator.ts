@@ -357,6 +357,13 @@ export function runBacktest(
           const hedgeId = `backtest_hedge_${i}`;
 
           if (riskSettings.hedgedDualExecutionEnabled) {
+            const halfUsdt = balance * 0.5;
+            const primaryLev = riskSettings.leverage;
+            const hedgeLev = Math.max(1, Math.round(riskSettings.leverage / 2));
+
+            const sizePrimary = (halfUsdt * primaryLev) / currentPrice;
+            const sizeHedge = (halfUsdt * hedgeLev) / currentPrice;
+
             let primarySl = primaryType === 'LONG' ? currentPrice - slDistance : currentPrice + slDistance;
             let primaryTp = primaryType === 'LONG' ? currentPrice + slDistance * riskSettings.riskRewardRatio : currentPrice - slDistance * riskSettings.riskRewardRatio;
 
@@ -367,8 +374,8 @@ export function runBacktest(
               symbol: 'MOCKUSDT',
               entryPrice: currentPrice,
               entryTime: currentCandle.time,
-              size: positionSize,
-              leverage: riskSettings.leverage,
+              size: sizePrimary,
+              leverage: primaryLev,
               stopLoss: parseFloat(primarySl.toFixed(2)),
               takeProfit: parseFloat(primaryTp.toFixed(2)),
               pnl: 0,
@@ -393,8 +400,8 @@ export function runBacktest(
               symbol: 'MOCKUSDT',
               entryPrice: currentPrice,
               entryTime: currentCandle.time,
-              size: positionSize,
-              leverage: Math.max(1, Math.round(riskSettings.leverage / 2)),
+              size: sizeHedge,
+              leverage: hedgeLev,
               stopLoss: parseFloat(hedgeSl.toFixed(2)),
               takeProfit: parseFloat(hedgeTp.toFixed(2)),
               pnl: 0,

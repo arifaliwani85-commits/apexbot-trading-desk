@@ -758,6 +758,13 @@ export default function App() {
               const primaryType = decision.signal === 'BUY' ? 'LONG' : 'SHORT';
               const hedgeType = primaryType === 'LONG' ? 'SHORT' : 'LONG';
 
+              const halfUsdt = account.balance * 0.5;
+              const primaryLev = riskSettings.leverage;
+              const hedgeLev = Math.max(1, Math.round(riskSettings.leverage / 2));
+              
+              const sizePrimary = (halfUsdt * primaryLev) / currentPrice;
+              const sizeHedge = (halfUsdt * hedgeLev) / currentPrice;
+
               let primarySl = primaryType === 'LONG' ? currentPrice - slDistance : currentPrice + slDistance;
               let primaryTp = primaryType === 'LONG' ? currentPrice + slDistance * riskSettings.riskRewardRatio : currentPrice - slDistance * riskSettings.riskRewardRatio;
 
@@ -767,8 +774,8 @@ export default function App() {
                 symbol: 'MOCKUSDT',
                 entryPrice: currentPrice,
                 entryTime: currentCandle.time,
-                size,
-                leverage: riskSettings.leverage,
+                size: sizePrimary,
+                leverage: primaryLev,
                 stopLoss: parseFloat(primarySl.toFixed(2)),
                 takeProfit: parseFloat(primaryTp.toFixed(2)),
                 pnl: 0,
@@ -792,8 +799,8 @@ export default function App() {
                 symbol: 'MOCKUSDT',
                 entryPrice: currentPrice,
                 entryTime: currentCandle.time,
-                size,
-                leverage: Math.max(1, Math.round(riskSettings.leverage / 2)),
+                size: sizeHedge,
+                leverage: hedgeLev,
                 stopLoss: parseFloat(hedgeSl.toFixed(2)),
                 takeProfit: parseFloat(hedgeTp.toFixed(2)),
                 pnl: 0,
@@ -808,7 +815,7 @@ export default function App() {
                 maxLeveragedPnL: 0,
               };
 
-              addLog(`📥 Executed Simulator Hedged Dual Entry. Primary: ${primaryType} (${riskSettings.leverage}X), Hedge: ${hedgeType} (${Math.max(1, Math.round(riskSettings.leverage / 2))}X).`, 'info');
+              addLog(`📥 Executed Simulator Hedged Dual Entry. Primary: ${primaryType} (${primaryLev}X, Size: ${sizePrimary.toFixed(4)}), Hedge: ${hedgeType} (${hedgeLev}X, Size: ${sizeHedge.toFixed(4)}).`, 'info');
               return [...prevPositions, primaryPos, hedgePos];
             } else {
               let slPrice = decision.signal === 'BUY' ? currentPrice - slDistance : currentPrice + slDistance;

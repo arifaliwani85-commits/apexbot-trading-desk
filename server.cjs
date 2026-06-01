@@ -2097,19 +2097,79 @@ setInterval(async () => {
             const primaryKey = `${symbol}_LONG`;
             const hedgeKey = `${symbol}_SHORT`;
 
+            // Sizing: Half and half of available USDT balance
+            const halfUsdt = exchangeBalance * 0.48; // 48% to leave 4% buffer for fees/slippage
+            const primaryLev = session.riskSettings.leverage;
+            const hedgeLev = Math.max(1, Math.round(session.riskSettings.leverage / 2));
+
+            let sizePrimary = (halfUsdt * primaryLev) / tickerPrice;
+            let sizeHedge = (halfUsdt * hedgeLev) / tickerPrice;
+
+            // Fetch min order size limits
+            const minSizePri = getMinOrderSize(session, marketSymbol, tickerPrice);
+
+            // Round size to exchange precision
+            if (session.exchangeInstance && session.exchangeInstance.markets && session.exchangeInstance.markets[marketSymbol]) {
+              try {
+                sizePrimary = parseFloat(session.exchangeInstance.amountToPrecision(marketSymbol, sizePrimary));
+              } catch (e) {
+                sizePrimary = parseFloat(sizePrimary.toFixed(4));
+              }
+              try {
+                sizeHedge = parseFloat(session.exchangeInstance.amountToPrecision(marketSymbol, sizeHedge));
+              } catch (e) {
+                sizeHedge = parseFloat(sizeHedge.toFixed(4));
+              }
+            } else {
+              sizePrimary = parseFloat(sizePrimary.toFixed(4));
+              sizeHedge = parseFloat(sizeHedge.toFixed(4));
+            }
+
+            // Ensure min size limits
+            if (sizePrimary < minSizePri) sizePrimary = minSizePri;
+            if (sizeHedge < minSizePri) sizeHedge = minSizePri;
+
+            // Check exposure limits (based on leverage)
+            const maxAllowedPri = exchangeBalance * primaryLev;
+            const maxAllowedHdg = exchangeBalance * hedgeLev;
+            if (sizePrimary * tickerPrice > maxAllowedPri) {
+              sizePrimary = maxAllowedPri / tickerPrice;
+              if (session.exchangeInstance && session.exchangeInstance.amountToPrecision) {
+                sizePrimary = parseFloat(session.exchangeInstance.amountToPrecision(marketSymbol, sizePrimary));
+              }
+            }
+            if (sizeHedge * tickerPrice > maxAllowedHdg) {
+              sizeHedge = maxAllowedHdg / tickerPrice;
+              if (session.exchangeInstance && session.exchangeInstance.amountToPrecision) {
+                sizeHedge = parseFloat(session.exchangeInstance.amountToPrecision(marketSymbol, sizeHedge));
+              }
+            }
+
+            if (sizePrimary <= 0 || sizeHedge <= 0) {
+              evaluation.status = 'REJECTED';
+              evaluation.reason = `Precision rounding reduced size to 0. Cannot execute.`;
+              session.evaluationStates[symbol] = evaluation;
+              logTickDetails(session.username, symbol, evaluation);
+              continue;
+            }
+
+            evaluation.calculatedSize = sizePrimary;
+
             // Adjust leverage dynamically if exchange live
             if (session.exchangeInstance) {
               try {
-                await session.exchangeInstance.setLeverage(session.riskSettings.leverage, marketSymbol, {
-                  buyLeverage: session.riskSettings.leverage,
-                  sellLeverage: Math.max(1, Math.round(session.riskSettings.leverage / 2))
+                const buyLeverage = decision.signal === 'BUY' ? primaryLev : hedgeLev;
+                const sellLeverage = decision.signal === 'BUY' ? hedgeLev : primaryLev;
+                await session.exchangeInstance.setLeverage(primaryLev, marketSymbol, {
+                  buyLeverage: buyLeverage,
+                  sellLeverage: sellLeverage
                 });
               } catch (levErr) {
                 session.addLog(`Leverage Adjustment Warning: ${levErr.message}`, 'warning');
               }
             }
 
-            session.addLog(`Sending simultaneous Hedged Dual entries to Exchange for ${symbol} (Size: ${size})...`, 'info');
+            session.addLog(`Sending simultaneous Hedged Dual entries to Exchange for ${symbol} (Primary Size: ${sizePrimary.toFixed(4)}, Hedge Size: ${sizeHedge.toFixed(4)})...`, 'info');
 
             let primaryOrder = null;
             let hedgeOrder = null;
@@ -2117,14 +2177,14 @@ setInterval(async () => {
             try {
               if (session.exchangeInstance) {
                 const results = await Promise.all([
-                  safeCreateMarketOrder(session.exchangeInstance, marketSymbol, primarySide, size, { positionIdx: primaryIdx }, (txt, typ) => session.addLog(`[Primary] ${txt}`, typ)),
-                  safeCreateMarketOrder(session.exchangeInstance, marketSymbol, hedgeSide, size, { positionIdx: hedgeIdx }, (txt, typ) => session.addLog(`[Hedge] ${txt}`, typ))
+                  safeCreateMarketOrder(session.exchangeInstance, marketSymbol, primarySide, sizePrimary, { positionIdx: primaryIdx }, (txt, typ) => session.addLog(`[Primary] ${txt}`, typ)),
+                  safeCreateMarketOrder(session.exchangeInstance, marketSymbol, hedgeSide, sizeHedge, { positionIdx: hedgeIdx }, (txt, typ) => session.addLog(`[Hedge] ${txt}`, typ))
                 ]);
                 primaryOrder = results[0];
                 hedgeOrder = results[1];
               } else {
-                primaryOrder = { price: tickerPrice, average: tickerPrice, amount: size };
-                hedgeOrder = { price: tickerPrice, average: tickerPrice, amount: size };
+                primaryOrder = { price: tickerPrice, average: tickerPrice, amount: sizePrimary };
+                hedgeOrder = { price: tickerPrice, average: tickerPrice, amount: sizeHedge };
               }
 
               const primaryFill = primaryOrder.price || primaryOrder.average || tickerPrice;
@@ -2139,8 +2199,8 @@ setInterval(async () => {
                 symbol: symbol,
                 entryPrice: primaryFill,
                 entryTime: Date.now(),
-                size: size,
-                leverage: session.riskSettings.leverage,
+                size: sizePrimary,
+                leverage: primaryLev,
                 stopLoss: parseFloat(slPrice.toFixed(2)),
                 takeProfit: parseFloat(tpPrice.toFixed(2)),
                 target1Price: parseFloat(target1Price.toFixed(2)),
@@ -2163,8 +2223,8 @@ setInterval(async () => {
                 symbol: symbol,
                 entryPrice: hedgeFill,
                 entryTime: Date.now(),
-                size: size,
-                leverage: Math.max(1, Math.round(session.riskSettings.leverage / 2)),
+                size: sizeHedge,
+                leverage: hedgeLev,
                 stopLoss: parseFloat((hedgeFill * (decision.signal === 'BUY' ? 1.05 : 0.95)).toFixed(2)),
                 takeProfit: parseFloat((hedgeFill * (decision.signal === 'BUY' ? 0.90 : 1.10)).toFixed(2)),
                 target1Price: parseFloat((hedgeFill * (decision.signal === 'BUY' ? 0.925 : 1.075)).toFixed(2)),
@@ -2196,7 +2256,7 @@ setInterval(async () => {
                 try {
                   const closeSide = primarySide === 'buy' ? 'sell' : 'buy';
                   const closeParams = session.isHedgeMode ? { positionIdx: primaryIdx } : { positionIdx: 0 };
-                  await safeCreateMarketOrder(session.exchangeInstance, marketSymbol, closeSide, size, closeParams, (txt, typ) => session.addLog(`[Rollback Pri] ${txt}`, typ));
+                  await safeCreateMarketOrder(session.exchangeInstance, marketSymbol, closeSide, sizePrimary, closeParams, (txt, typ) => session.addLog(`[Rollback Pri] ${txt}`, typ));
                   session.addLog(`Rollback: Cleaned up primary position.`, 'success');
                 } catch (priErr) {
                   session.addLog(`Rollback Error: Failed to clean up primary position: ${priErr.message}`, 'danger');
@@ -2207,7 +2267,7 @@ setInterval(async () => {
                 try {
                   const closeSide = hedgeSide === 'buy' ? 'sell' : 'buy';
                   const closeParams = session.isHedgeMode ? { positionIdx: hedgeIdx } : { positionIdx: 0 };
-                  await safeCreateMarketOrder(session.exchangeInstance, marketSymbol, closeSide, size, closeParams, (txt, typ) => session.addLog(`[Rollback Hdg] ${txt}`, typ));
+                  await safeCreateMarketOrder(session.exchangeInstance, marketSymbol, closeSide, sizeHedge, closeParams, (txt, typ) => session.addLog(`[Rollback Hdg] ${txt}`, typ));
                   session.addLog(`Rollback: Cleaned up hedge position.`, 'success');
                 } catch (hdgErr) {
                   session.addLog(`Rollback Error: Failed to clean up hedge position: ${hdgErr.message}`, 'danger');
