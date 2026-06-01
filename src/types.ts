@@ -44,6 +44,11 @@ export interface Position {
   minObservedPrice?: number; // for trailing stop tracking (short positions)
   halfClosed?: boolean;      // whether 50% was closed at Target 1
   target1Price?: number;     // partial take profit level
+  isHedgedPair?: boolean;
+  hedgedRole?: 'PRIMARY' | 'HEDGE';
+  hedgedScenario?: 'A' | 'B' | 'C' | 'NONE';
+  pairedPositionId?: string;
+  maxLeveragedPnL?: number;
 }
 
 export type StrategyType = 'TREND_FOLLOWING' | 'MEAN_REVERSION' | 'MOMENTUM_BREAKOUT' | 'HIGH_FREQUENCY_SCALPER' | 'NEWS_SENTIMENT_TRADING';
@@ -71,6 +76,10 @@ export interface RiskSettings {
   leverage: number; // Leverage factor (default 1)
   maxConcurrentPositions: number; // maximum concurrent assets to trade
   partialTakeProfitEnabled: boolean; // close 50% at 1.5R and move SL to break-even
+  hedgedDualExecutionEnabled: boolean;
+  maxPortfolioDrawdown: number;
+  volatilityAtrMin: number;
+  volatilitySpreadMax: number;
 }
 
 export interface AccountState {

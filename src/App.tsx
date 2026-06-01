@@ -78,6 +78,10 @@ export default function App() {
     leverage: 1, // 1x leverage by default
     maxConcurrentPositions: 3,
     partialTakeProfitEnabled: true,
+    hedgedDualExecutionEnabled: true,
+    maxPortfolioDrawdown: 10.0,
+    volatilityAtrMin: 0.05,
+    volatilitySpreadMax: 0.1,
   });
 
   const [showIndicators, setShowIndicators] = useState({
@@ -90,6 +94,7 @@ export default function App() {
   // --- Bot/Simulator States ---
   const [candles, setCandles] = useState<Candle[]>([]);
   const [activePosition, setActivePosition] = useState<Position | null>(null);
+  const [simulatorPositions, setSimulatorPositions] = useState<Position[]>([]);
   const [allPositions, setAllPositions] = useState<Position[]>([]);
   const [closedTrades, setClosedTrades] = useState<Position[]>([]);
   const [logs, setLogs] = useState<LogMessage[]>([]);
@@ -376,6 +381,14 @@ export default function App() {
         console.error('Error toggling bot:', e);
       }
     } else {
+      if (newActiveState) {
+        setAccount(prev => ({
+          ...prev,
+          maxDrawdownReached: false,
+          dailyStartBalance: prev.balance,
+          maxEquity: prev.balance,
+        }));
+      }
       setBotActive(newActiveState);
       setHasUnappliedChanges(false); // Reset on apply
     }
@@ -436,161 +449,373 @@ export default function App() {
         const currentPrice = currentCandle.close;
 
         // 2. Manage Active Position (SL/TP & Trailing Stops)
-        setActivePosition((currPos) => {
-          if (!currPos) return null;
+        setSimulatorPositions((prevPositions) => {
+          if (prevPositions.length === 0) return [];
 
-          let exitPrice = 0;
-          let exitReason: Position['exitReason'] = undefined;
-          
-          // Compute floating PnL
-          const diff = currPos.type === 'LONG'
-            ? currentPrice - currPos.entryPrice
-            : currPos.entryPrice - currentPrice;
-          const pnl = diff * currPos.size * currPos.leverage;
-          const pnlPercent = (pnl / (currPos.entryPrice * currPos.size)) * 100;
+          let updatedPositions = [...prevPositions];
+          const toCloseIds = [];
+          const nextPositions = [];
 
-          // Track peak/valley for trailing stop
-          const updatedPos = { ...currPos, pnl, pnlPercent };
-          if (currPos.type === 'LONG') {
-            updatedPos.maxObservedPrice = Math.max(currPos.maxObservedPrice || currPos.entryPrice, currentPrice);
-          } else {
-            updatedPos.minObservedPrice = Math.min(currPos.minObservedPrice || currPos.entryPrice, currentPrice);
-          }
-
-          // Trailing stop adjustment
-          if (riskSettings.trailingStopEnabled) {
-            const slDistance = Math.abs(currPos.entryPrice - currPos.stopLoss);
+          // Compute floating PnLs and peak extremes first
+          updatedPositions = updatedPositions.map(pos => {
+            const diff = pos.type === 'LONG'
+              ? currentPrice - pos.entryPrice
+              : pos.entryPrice - currentPrice;
+            const pnl = diff * pos.size * pos.leverage;
+            const pnlPercent = (pnl / (pos.entryPrice * pos.size)) * 100;
             
-            if (currPos.type === 'LONG') {
-              const triggerPrice = currPos.entryPrice + slDistance * riskSettings.trailingStopTrigger;
-              if ((updatedPos.maxObservedPrice || 0) > triggerPrice) {
-                // Move SL to entry + 20% risk offset (Guaranteed risk-free trade!)
-                const newSL = parseFloat((currPos.entryPrice + slDistance * 0.2).toFixed(2));
-                if (newSL > currPos.stopLoss) {
-                  updatedPos.stopLoss = newSL;
-                  addLog(`Trailing Stop adjusted higher for LONG to $${newSL}. Trade is now risk-free!`, 'info');
-                }
-              }
+            const updated = { ...pos, pnl, pnlPercent };
+            updated.maxLeveragedPnL = Math.max(updated.maxLeveragedPnL || 0, pnlPercent);
+
+            if (pos.type === 'LONG') {
+              updated.maxObservedPrice = Math.max(pos.maxObservedPrice || pos.entryPrice, currentPrice);
             } else {
-              const triggerPrice = currPos.entryPrice - slDistance * riskSettings.trailingStopTrigger;
-              if ((updatedPos.minObservedPrice || Infinity) < triggerPrice) {
-                const newSL = parseFloat((currPos.entryPrice - slDistance * 0.2).toFixed(2));
-                if (newSL < currPos.stopLoss) {
-                  updatedPos.stopLoss = newSL;
-                  addLog(`Trailing Stop adjusted lower for SHORT to $${newSL}. Trade is now risk-free!`, 'info');
+              updated.minObservedPrice = Math.min(pos.minObservedPrice || pos.entryPrice, currentPrice);
+            }
+            return updated;
+          });
+
+          // Evaluate exits for each position
+          for (const pos of updatedPositions) {
+            if (toCloseIds.includes(pos.id)) continue;
+
+            let exitPrice = 0;
+            let exitReason = undefined;
+
+            if (pos.isHedgedPair) {
+              const paired = updatedPositions.find(p => p.id === pos.pairedPositionId && !toCloseIds.includes(p.id));
+              const role = pos.hedgedRole;
+
+              if (role === 'PRIMARY') {
+                // SCENARIO A: Primary reaches +50% PnL -> Close primary, flag hedge as Scenario A
+                if (pos.pnlPercent >= 50) {
+                  exitPrice = currentPrice;
+                  exitReason = 'TP';
+                  toCloseIds.push(pos.id);
+                  if (paired) {
+                    paired.hedgedScenario = 'A';
+                  }
+                  addLog(`[HEDGE ENGINE] Simulator: Scenario A triggered for MOCKUSDT: Primary reached +50% PnL. Closing...`, 'success');
+                }
+                // SCENARIO C: Primary reaches +60% PnL -> Trailing stop at 30% peak PnL
+                else if (pos.pnlPercent >= 60 || pos.hedgedScenario === 'C') {
+                  if (pos.hedgedScenario !== 'C') {
+                    pos.hedgedScenario = 'C';
+                    if (paired) paired.hedgedScenario = 'C';
+                    addLog(`[HEDGE ENGINE] Simulator: Scenario C triggered for MOCKUSDT: Primary reached +60% PnL. Trailing Profit active.`, 'success');
+                  }
+                  const trailingFloor = 0.30 * (pos.maxLeveragedPnL || 0);
+                  if (pos.pnlPercent < trailingFloor) {
+                    exitPrice = currentPrice;
+                    exitReason = 'TRAILING_STOP';
+                    toCloseIds.push(pos.id);
+                    addLog(`[HEDGE ENGINE] Simulator: Trailing Stop hit for Primary. Closed at ${pos.pnlPercent.toFixed(1)}% PnL.`, 'warning');
+                  }
+                }
+                // SCENARIO B: If primary is in Scenario B monitoring
+                else if (pos.hedgedScenario === 'B') {
+                  if (pos.pnlPercent >= 40) {
+                    exitPrice = currentPrice;
+                    exitReason = 'TP';
+                    toCloseIds.push(pos.id);
+                    addLog(`[HEDGE ENGINE] Simulator: Scenario B recovery hit. Primary closed at +40% PnL.`, 'success');
+                  }
+                }
+              } else if (role === 'HEDGE') {
+                // SCENARIO A: If primary closed, monitor Scenario A
+                if (pos.hedgedScenario === 'A') {
+                  if (pos.pnlPercent >= 10) {
+                    exitPrice = currentPrice;
+                    exitReason = 'TP';
+                    toCloseIds.push(pos.id);
+                    addLog(`[HEDGE ENGINE] Simulator: Scenario A Hedge profit target (+10%) hit. Closing...`, 'success');
+                  } else if (pos.pnlPercent <= -10) {
+                    exitPrice = currentPrice;
+                    exitReason = 'SL';
+                    toCloseIds.push(pos.id);
+                    addLog(`[HEDGE ENGINE] Simulator: Scenario A Hedge stop loss (-10%) hit. Closing...`, 'danger');
+                  }
+                }
+                // SCENARIO B: Hedge reaches +70% PnL and primary is losing -> Close hedge, flag primary as Scenario B
+                else if (pos.pnlPercent >= 70 && paired && paired.pnlPercent < 0) {
+                  exitPrice = currentPrice;
+                  exitReason = 'TP';
+                  toCloseIds.push(pos.id);
+                  paired.hedgedScenario = 'B';
+                  addLog(`[HEDGE ENGINE] Simulator: Scenario B triggered. Hedge reached +70% PnL. Closing hedge.`, 'success');
+                }
+                // SCENARIO C: Under Scenario C: exit hedge if <= -80% PnL or >= +10% PnL
+                else if (pos.hedgedScenario === 'C') {
+                  if (pos.pnlPercent <= -80) {
+                    exitPrice = currentPrice;
+                    exitReason = 'SL';
+                    toCloseIds.push(pos.id);
+                    addLog(`[HEDGE ENGINE] Simulator: Scenario C Hedge hit stop loss (-80% PnL). Closing...`, 'danger');
+                  } else if (pos.pnlPercent >= 10) {
+                    exitPrice = currentPrice;
+                    exitReason = 'TP';
+                    toCloseIds.push(pos.id);
+                    addLog(`[HEDGE ENGINE] Simulator: Scenario C Hedge hit profit target (+10% PnL). Closing...`, 'success');
+                  }
                 }
               }
             }
-          }
 
-          // Check if Stop Loss or Take Profit is hit
-          if (currPos.type === 'LONG') {
-            if (currentPrice <= updatedPos.stopLoss) {
-              exitPrice = updatedPos.stopLoss;
-              exitReason = riskSettings.trailingStopEnabled && exitPrice > currPos.entryPrice ? 'TRAILING_STOP' : 'SL';
-            } else if (currentPrice >= updatedPos.takeProfit) {
-              exitPrice = updatedPos.takeProfit;
-              exitReason = 'TP';
+            // Fallback to standard exits (SL / TP / Trailing Stop) if scenario did not trigger exit
+            if (!exitReason) {
+              if (pos.type === 'LONG') {
+                if (currentPrice <= pos.stopLoss) {
+                  exitPrice = pos.stopLoss;
+                  exitReason = riskSettings.trailingStopEnabled && exitPrice > pos.entryPrice ? 'TRAILING_STOP' : 'SL';
+                  toCloseIds.push(pos.id);
+                } else if (currentPrice >= pos.takeProfit) {
+                  exitPrice = pos.takeProfit;
+                  exitReason = 'TP';
+                  toCloseIds.push(pos.id);
+                }
+              } else {
+                if (currentPrice >= pos.stopLoss) {
+                  exitPrice = pos.stopLoss;
+                  exitReason = riskSettings.trailingStopEnabled && exitPrice < pos.entryPrice ? 'TRAILING_STOP' : 'SL';
+                  toCloseIds.push(pos.id);
+                } else if (currentPrice <= pos.takeProfit) {
+                  exitPrice = pos.takeProfit;
+                  exitReason = 'TP';
+                  toCloseIds.push(pos.id);
+                }
+              }
             }
-          } else {
-            if (currentPrice >= updatedPos.stopLoss) {
-              exitPrice = updatedPos.stopLoss;
-              exitReason = riskSettings.trailingStopEnabled && exitPrice < currPos.entryPrice ? 'TRAILING_STOP' : 'SL';
-            } else if (currentPrice <= updatedPos.takeProfit) {
-              exitPrice = updatedPos.takeProfit;
-              exitReason = 'TP';
-            }
-          }
 
-          if (exitReason) {
-            // Trigger Order Fill / Position Close
-            const finalPnl = currPos.type === 'LONG'
-              ? (exitPrice - currPos.entryPrice) * currPos.size * currPos.leverage
-              : (currPos.entryPrice - exitPrice) * currPos.size * currPos.leverage;
+            if (exitReason) {
+              const finalPnl = pos.type === 'LONG'
+                ? (exitPrice - pos.entryPrice) * pos.size * pos.leverage
+                : (pos.entryPrice - exitPrice) * pos.size * pos.leverage;
 
-            const closedPos: Position = {
-              ...updatedPos,
-              status: 'CLOSED',
-              exitPrice,
-              exitTime: currentCandle.time,
-              exitReason,
-              pnl: finalPnl,
-              pnlPercent: (finalPnl / (currPos.entryPrice * currPos.size)) * 100,
-            };
-
-            // Update Account Balance
-            setAccount((prevAcc) => {
-              const nextBalance = prevAcc.balance + finalPnl;
-              const isWin = finalPnl > 0;
-              return {
-                ...prevAcc,
-                balance: nextBalance,
-                equity: nextBalance,
-                winCount: prevAcc.winCount + (isWin ? 1 : 0),
-                lossCount: prevAcc.lossCount + (isWin ? 0 : 1),
-                totalProfit: prevAcc.totalProfit + finalPnl,
+              const closedPos: Position = {
+                ...pos,
+                status: 'CLOSED',
+                exitPrice,
+                exitTime: currentCandle.time,
+                exitReason,
+                pnl: finalPnl,
+                pnlPercent: (finalPnl / (pos.entryPrice * pos.size)) * 100,
               };
-            });
 
-            setClosedTrades((prevTrades) => [...prevTrades, closedPos]);
-            
-            const logMsg = exitReason === 'TP'
-              ? `🎯 TAKE PROFIT hit at $${exitPrice.toFixed(2)}. Profit: +$${finalPnl.toFixed(2)}!`
-              : exitReason === 'TRAILING_STOP'
-              ? `🛡️ TRAILING STOP hit at $${exitPrice.toFixed(2)}. Capital preserved, profit secured: +$${finalPnl.toFixed(2)}.`
-              : `🛑 STOP LOSS hit at $${exitPrice.toFixed(2)}. Loss locked: -$${Math.abs(finalPnl).toFixed(2)}.`;
-            
-            addLog(logMsg, exitReason === 'TP' || exitReason === 'TRAILING_STOP' ? 'success' : 'danger');
-            lastExitTimeRef.current = currentCandle.time;
+              setAccount((prevAcc) => {
+                const nextBalance = prevAcc.balance + finalPnl;
+                const isWin = finalPnl > 0;
+                return {
+                  ...prevAcc,
+                  balance: nextBalance,
+                  equity: nextBalance,
+                  winCount: prevAcc.winCount + (isWin ? 1 : 0),
+                  lossCount: prevAcc.lossCount + (isWin ? 0 : 1),
+                  totalProfit: prevAcc.totalProfit + finalPnl,
+                };
+              });
 
-            return null; // clear active position
+              setClosedTrades((prevTrades) => [...prevTrades, closedPos]);
+              
+              const logMsg = exitReason === 'TP'
+                ? `🎯 TAKE PROFIT hit at $${exitPrice.toFixed(2)}. Profit: +$${finalPnl.toFixed(2)}!`
+                : exitReason === 'TRAILING_STOP'
+                ? `🛡️ TRAILING STOP hit at $${exitPrice.toFixed(2)}. Capital preserved, profit secured: +$${finalPnl.toFixed(2)}.`
+                : `🛑 STOP LOSS hit at $${exitPrice.toFixed(2)}. Loss locked: -$${Math.abs(finalPnl).toFixed(2)}.`;
+              
+              addLog(logMsg, exitReason === 'TP' || exitReason === 'TRAILING_STOP' ? 'success' : 'danger');
+              lastExitTimeRef.current = currentCandle.time;
+            } else {
+              nextPositions.push(pos);
+            }
           }
 
-          // Otherwise, update position floating PnL
-          return updatedPos;
+          // Compute final net unrealized PnL for positions that remain open
+          let netUnrealizedPnL = 0;
+          nextPositions.forEach(pos => {
+            netUnrealizedPnL += pos.pnl || 0;
+          });
+
+          const currentEquity = account.balance + netUnrealizedPnL;
+          const nextMaxEquity = Math.max(account.maxEquity || currentEquity, currentEquity);
+
+          // Compute drawdowns
+          let dailyDD = 0;
+          if (account.dailyStartBalance > 0 && currentEquity < account.dailyStartBalance) {
+            dailyDD = ((account.dailyStartBalance - currentEquity) / account.dailyStartBalance) * 100;
+          }
+
+          let portfolioDD = 0;
+          if (nextMaxEquity > 0) {
+            portfolioDD = ((nextMaxEquity - currentEquity) / nextMaxEquity) * 100;
+          }
+
+          // Circuit Breakers
+          const maxDailyDD = riskSettings.maxDailyDrawdown;
+          const maxPortfolioDD = riskSettings.maxPortfolioDrawdown || 10.0;
+
+          if ((dailyDD >= maxDailyDD || portfolioDD >= maxPortfolioDD) && !account.maxDrawdownReached) {
+            const reason = dailyDD >= maxDailyDD
+              ? `Daily Max Drawdown limit (${maxDailyDD}%) hit! (Current: -${dailyDD.toFixed(2)}%)`
+              : `Portfolio Max Drawdown limit (${maxPortfolioDD}%) hit! (Current: -${portfolioDD.toFixed(2)}%)`;
+
+            setTimeout(() => {
+              setBotActive(false);
+              addLog(`[CRITICAL] Simulator: ${reason}. Triggering Emergency Circuit Breaker. Closing all positions...`, 'danger');
+              
+              setSimulatorPositions(activePos => {
+                const closedList = activePos.map(pos => {
+                  const diff = pos.type === 'LONG' ? currentPrice - pos.entryPrice : pos.entryPrice - currentPrice;
+                  const finalPnl = diff * pos.size * pos.leverage;
+                  return {
+                    ...pos,
+                    status: 'CLOSED' as const,
+                    exitPrice: currentPrice,
+                    exitTime: currentCandle.time,
+                    exitReason: 'DRAWDOWN' as const,
+                    pnl: finalPnl,
+                    pnlPercent: (finalPnl / (pos.entryPrice * pos.size)) * 100,
+                  };
+                });
+
+                setClosedTrades(prev => [...prev, ...closedList]);
+                
+                const totalClosedPnl = closedList.reduce((sum, p) => sum + p.pnl, 0);
+                setAccount(pa => ({
+                  ...pa,
+                  balance: pa.balance + totalClosedPnl,
+                  equity: pa.balance + totalClosedPnl,
+                  maxEquity: Math.max(pa.maxEquity, pa.balance + totalClosedPnl),
+                  maxDrawdownReached: true,
+                  lossCount: pa.lossCount + closedList.length,
+                  totalProfit: pa.totalProfit + totalClosedPnl,
+                }));
+
+                return [];
+              });
+            }, 0);
+          } else {
+            // Regularly update floating equity
+            setTimeout(() => {
+              setAccount(prev => {
+                if (Math.abs(prev.equity - currentEquity) > 0.01 || Math.abs(prev.maxEquity - nextMaxEquity) > 0.01) {
+                  return {
+                    ...prev,
+                    equity: currentEquity,
+                    maxEquity: nextMaxEquity
+                  };
+                }
+                return prev;
+              });
+            }, 0);
+          }
+
+          return nextPositions;
         });
 
         // 3. Evaluate entry rules (Only on closed candles to avoid repaint signals)
-        if (isNewCandle && !activePosition) {
-          // Check 3-candle cooldown (15 minutes on 5m timeframe)
-          if (lastExitTimeRef.current && (currentCandle.time - lastExitTimeRef.current) < 3 * 5 * 60 * 1000) {
-            return calculatedCandles;
-          }
-          const decision = evaluateStrategy(calculatedCandles, stratSettings);
-          
-          if (decision.signal) {
-            const atrValue = currentCandle.atr || (currentCandle.high - currentCandle.low) || 5.0;
-            const slDistance = atrValue * riskSettings.atrMultiplier;
-            
-            let slPrice = 0;
-            let tpPrice = 0;
-            
-            if (decision.signal === 'BUY') {
-              slPrice = currentPrice - slDistance;
-              tpPrice = currentPrice + slDistance * riskSettings.riskRewardRatio;
-            } else { // SELL
-              slPrice = currentPrice + slDistance;
-              tpPrice = currentPrice - slDistance * riskSettings.riskRewardRatio;
+        if (isNewCandle) {
+          // Check max concurrent active symbols count
+          setSimulatorPositions((prevPositions) => {
+            const activeSymbolsCount = Array.from(new Set(prevPositions.map(p => p.symbol))).length;
+            if (activeSymbolsCount >= (riskSettings.maxConcurrentPositions || 3)) {
+              return prevPositions;
             }
 
-            // --- THE 1% RISK POSITION SIZING MATH ---
-            // Max loss allowed in USD = Account Balance * (riskPercent / 100)
-            // Stop distance = slDistance
-            // Sizing = MaxLossUSD / (Stop Distance * Leverage)
-            setAccount((currAcc) => {
-              const maxLossUsd = currAcc.balance * (riskSettings.riskPercent / 100);
-              let size = maxLossUsd / slDistance;
-              
-              // Capital limits check (Leveraged Exposure cap)
-              const exposure = size * currentPrice;
-              const maxAllowedExposure = currAcc.balance * riskSettings.leverage;
-              
-              if (exposure > maxAllowedExposure) {
-                size = maxAllowedExposure / currentPrice;
-              }
+            // Cooldown check
+            if (lastExitTimeRef.current && (currentCandle.time - lastExitTimeRef.current) < 3 * 5 * 60 * 1000) {
+              return prevPositions;
+            }
 
-              const newPos: Position = {
-                id: `trade_${Date.now()}`,
+            const decision = evaluateStrategy(calculatedCandles, stratSettings);
+            if (!decision.signal) return prevPositions;
+
+            // Volatility protection check (ATR min)
+            const atrValue = currentCandle.atr || (currentCandle.high - currentCandle.low) || 1.0;
+            const atrPercent = (atrValue / currentPrice) * 100;
+            const atrMin = riskSettings.volatilityAtrMin !== undefined ? riskSettings.volatilityAtrMin : 0.05;
+            
+            if (atrPercent < atrMin) {
+              addLog(`Volatility Protection: Signal skipped for MOCKUSDT due to ATR ${atrPercent.toFixed(3)}% < minimum ${atrMin}%`, 'warning');
+              return prevPositions;
+            }
+
+            const slDistance = atrValue * riskSettings.atrMultiplier;
+            const maxLossUsd = account.balance * (riskSettings.riskPercent / 100);
+            let size = maxLossUsd / slDistance;
+
+            const totalCapitalRequired = size * currentPrice;
+            const maxAllowedExposure = account.balance * riskSettings.leverage;
+            if (totalCapitalRequired > maxAllowedExposure) {
+              size = maxAllowedExposure / currentPrice;
+            }
+
+            addLog(`🔔 Trade Signal triggered: ${decision.reason}`, 'trade');
+
+            if (riskSettings.hedgedDualExecutionEnabled) {
+              const primaryId = `sim_pri_${Date.now()}`;
+              const hedgeId = `sim_hdg_${Date.now()}`;
+              
+              const primaryType = decision.signal === 'BUY' ? 'LONG' : 'SHORT';
+              const hedgeType = primaryType === 'LONG' ? 'SHORT' : 'LONG';
+
+              let primarySl = primaryType === 'LONG' ? currentPrice - slDistance : currentPrice + slDistance;
+              let primaryTp = primaryType === 'LONG' ? currentPrice + slDistance * riskSettings.riskRewardRatio : currentPrice - slDistance * riskSettings.riskRewardRatio;
+
+              const primaryPos: Position = {
+                id: primaryId,
+                type: primaryType as any,
+                symbol: 'MOCKUSDT',
+                entryPrice: currentPrice,
+                entryTime: currentCandle.time,
+                size,
+                leverage: riskSettings.leverage,
+                stopLoss: parseFloat(primarySl.toFixed(2)),
+                takeProfit: parseFloat(primaryTp.toFixed(2)),
+                pnl: 0,
+                pnlPercent: 0,
+                status: 'OPEN',
+                maxObservedPrice: currentPrice,
+                minObservedPrice: currentPrice,
+                isHedgedPair: true,
+                hedgedRole: 'PRIMARY',
+                hedgedScenario: 'NONE',
+                pairedPositionId: hedgeId,
+                maxLeveragedPnL: 0,
+              };
+
+              let hedgeSl = hedgeType === 'LONG' ? currentPrice - slDistance : currentPrice + slDistance;
+              let hedgeTp = hedgeType === 'LONG' ? currentPrice + slDistance * riskSettings.riskRewardRatio : currentPrice - slDistance * riskSettings.riskRewardRatio;
+
+              const hedgePos: Position = {
+                id: hedgeId,
+                type: hedgeType as any,
+                symbol: 'MOCKUSDT',
+                entryPrice: currentPrice,
+                entryTime: currentCandle.time,
+                size,
+                leverage: Math.max(1, Math.round(riskSettings.leverage / 2)),
+                stopLoss: parseFloat(hedgeSl.toFixed(2)),
+                takeProfit: parseFloat(hedgeTp.toFixed(2)),
+                pnl: 0,
+                pnlPercent: 0,
+                status: 'OPEN',
+                maxObservedPrice: currentPrice,
+                minObservedPrice: currentPrice,
+                isHedgedPair: true,
+                hedgedRole: 'HEDGE',
+                hedgedScenario: 'NONE',
+                pairedPositionId: primaryId,
+                maxLeveragedPnL: 0,
+              };
+
+              addLog(`📥 Executed Simulator Hedged Dual Entry. Primary: ${primaryType} (${riskSettings.leverage}X), Hedge: ${hedgeType} (${Math.max(1, Math.round(riskSettings.leverage / 2))}X).`, 'info');
+              return [...prevPositions, primaryPos, hedgePos];
+            } else {
+              let slPrice = decision.signal === 'BUY' ? currentPrice - slDistance : currentPrice + slDistance;
+              let tpPrice = decision.signal === 'BUY' ? currentPrice + slDistance * riskSettings.riskRewardRatio : currentPrice - slDistance * riskSettings.riskRewardRatio;
+
+              const singlePos: Position = {
+                id: `sim_single_${Date.now()}`,
                 type: decision.signal === 'BUY' ? 'LONG' : 'SHORT',
                 symbol: 'MOCKUSDT',
                 entryPrice: currentPrice,
@@ -606,13 +831,10 @@ export default function App() {
                 minObservedPrice: currentPrice,
               };
 
-              setActivePosition(newPos);
-              addLog(`🔔 Trade Signal triggered: ${decision.reason}`, 'trade');
-              addLog(`📥 Executed ${newPos.type} Order. Size: ${size.toFixed(4)} MOCK ($${(size*currentPrice).toFixed(2)} exposure). SL: $${slPrice.toFixed(2)}, TP: $${tpPrice.toFixed(2)}. Calculated potential loss is exactly $${(size*slDistance).toFixed(2)} (${riskSettings.riskPercent}% risk).`, 'info');
-
-              return currAcc;
-            });
-          }
+              addLog(`📥 Executed Simulator Single Position Entry: ${singlePos.type}.`, 'info');
+              return [...prevPositions, singlePos];
+            }
+          });
         }
 
         return calculatedCandles;
@@ -622,7 +844,7 @@ export default function App() {
     return () => {
       if (simIntervalRef.current) clearInterval(simIntervalRef.current);
     };
-  }, [botActive, stratSettings, riskSettings, activePosition]);
+  }, [botActive, stratSettings, riskSettings, simulatorPositions]);
 
   // --- Manual Close Position ---
   const handleManualClose = async (symbolToClose?: string) => {
@@ -649,38 +871,50 @@ export default function App() {
       return;
     }
 
-    if (!activePosition) return;
-    const currentPrice = candles[candles.length - 1].close;
-    const finalPnl = activePosition.type === 'LONG'
-      ? (currentPrice - activePosition.entryPrice) * activePosition.size * activePosition.leverage
-      : (activePosition.entryPrice - currentPrice) * activePosition.size * activePosition.leverage;
+    const targetSymbol = symbolToClose || 'MOCKUSDT';
+    
+    setSimulatorPositions((prevPositions) => {
+      const remaining = [];
+      const currentPrice = candles[candles.length - 1].close;
 
-    const closedPos: Position = {
-      ...activePosition,
-      status: 'CLOSED',
-      exitPrice: currentPrice,
-      exitTime: Date.now(),
-      exitReason: 'MANUAL',
-      pnl: finalPnl,
-      pnlPercent: (finalPnl / (activePosition.entryPrice * activePosition.size)) * 100,
-    };
+      for (const pos of prevPositions) {
+        if (pos.symbol === targetSymbol || targetSymbol === 'MOCKUSDT') {
+          const finalPnl = pos.type === 'LONG'
+            ? (currentPrice - pos.entryPrice) * pos.size * pos.leverage
+            : (pos.entryPrice - currentPrice) * pos.size * pos.leverage;
 
-    setAccount((prevAcc) => {
-      const nextBalance = prevAcc.balance + finalPnl;
-      return {
-        ...prevAcc,
-        balance: nextBalance,
-        equity: nextBalance,
-        winCount: prevAcc.winCount + (finalPnl > 0 ? 1 : 0),
-        lossCount: prevAcc.lossCount + (finalPnl <= 0 ? 1 : 0),
-        totalProfit: prevAcc.totalProfit + finalPnl,
-      };
+          const closedPos: Position = {
+            ...pos,
+            status: 'CLOSED',
+            exitPrice: currentPrice,
+            exitTime: Date.now(),
+            exitReason: 'MANUAL',
+            pnl: finalPnl,
+            pnlPercent: (finalPnl / (pos.entryPrice * pos.size)) * 100,
+          };
+
+          setAccount((prevAcc) => {
+            const nextBalance = prevAcc.balance + finalPnl;
+            return {
+              ...prevAcc,
+              balance: nextBalance,
+              equity: nextBalance,
+              winCount: prevAcc.winCount + (finalPnl > 0 ? 1 : 0),
+              lossCount: prevAcc.lossCount + (finalPnl <= 0 ? 1 : 0),
+              totalProfit: prevAcc.totalProfit + finalPnl,
+            };
+          });
+
+          setClosedTrades((prevTrades) => [...prevTrades, closedPos]);
+          addLog(`⚠️ POSITION CLOSED MANUALLY at $${currentPrice.toFixed(2)}. PnL: ${finalPnl >= 0 ? '+' : ''}$${finalPnl.toFixed(2)}.`, 'warning');
+        } else {
+          remaining.push(pos);
+        }
+      }
+      return remaining;
     });
 
-    setClosedTrades((prevTrades) => [...prevTrades, closedPos]);
-    setActivePosition(null);
     lastExitTimeRef.current = Date.now();
-    addLog(`⚠️ POSITION CLOSED MANUALLY at $${currentPrice.toFixed(2)}. PnL: ${finalPnl >= 0 ? '+' : ''}$${finalPnl.toFixed(2)}.`, 'warning');
   };
 
   // --- Run Historical Backtest ---
@@ -711,6 +945,14 @@ export default function App() {
   };
 
   const currentPrice = candles.length > 0 ? candles[candles.length - 1].close : 50000;
+
+  const currentActivePosition = botMode === 'EXCHANGE_LIVE'
+    ? (allPositions.length > 0 ? allPositions[0] : null)
+    : (simulatorPositions.length > 0 ? simulatorPositions[0] : null);
+
+  const currentAllPositions = botMode === 'EXCHANGE_LIVE'
+    ? allPositions
+    : simulatorPositions;
 
   if (!userToken) {
     return <AuthPage onLoginSuccess={handleLoginSuccess} />;
@@ -830,7 +1072,7 @@ export default function App() {
             </div>
             <TradingChart
               candles={candles}
-              activePosition={activePosition}
+              activePosition={currentActivePosition}
               closedTrades={closedTrades}
               showIndicators={showIndicators}
               symbol={viewedSymbol}
@@ -843,13 +1085,14 @@ export default function App() {
                 riskSettings={riskSettings}
               />
               <TradeLogs
-                activePosition={activePosition}
+                activePosition={currentActivePosition}
                 closedTrades={closedTrades}
                 logs={logs}
                 onClosePosition={handleManualClose}
                 latestPrice={currentPrice}
-                allPositions={botMode === 'EXCHANGE_LIVE' ? allPositions : activePosition ? [activePosition] : []}
+                allPositions={currentAllPositions}
                 evaluationStates={evaluationStates}
+                accountBalance={account.balance}
               />
             </div>
           </div>

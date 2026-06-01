@@ -496,6 +496,88 @@ export const StrategyConfig: React.FC<StrategyConfigProps> = ({
           Closes 50% of position at 1.5R, moving remaining SL to break-even to guarantee a risk-free trade.
         </div>
 
+        {/* Hedged Dual Position Execution Engine Switch */}
+        <div className="switch-group" style={{ marginTop: '12px' }}>
+          <span className="switch-label" style={{ cursor: 'pointer' }} onClick={() => handleRiskParamChange('hedgedDualExecutionEnabled', !riskSettings.hedgedDualExecutionEnabled)}>
+            Hedged Dual Position Engine
+          </span>
+          <label className="switch">
+            <input
+              type="checkbox"
+              checked={riskSettings.hedgedDualExecutionEnabled}
+              onChange={(e) => handleRiskParamChange('hedgedDualExecutionEnabled', e.target.checked)} 
+            />
+            <span className="slider"></span>
+          </label>
+        </div>
+        <div style={{ fontSize: '10px', color: 'var(--text-secondary)', paddingLeft: '12px', marginBottom: '12px' }}>
+          Opens a primary position (leverage X) and a hedge position (leverage X/2, opposite direction) simultaneously.
+        </div>
+
+        {riskSettings.hedgedDualExecutionEnabled && (
+          <div className="form-group" style={{ paddingLeft: '12px', borderLeft: '2px solid var(--border-color)', marginTop: '8px', marginBottom: '12px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+            {/* Portfolio Drawdown Limit */}
+            <div className="form-group" style={{ marginBottom: '4px' }}>
+              <label className="form-label">
+                <span>Max Portfolio Drawdown:</span>
+                <span className="val">{riskSettings.maxPortfolioDrawdown || 10.0}%</span>
+              </label>
+              <input
+                type="range"
+                min="2.0"
+                max="15.0"
+                step="0.5"
+                className="range-input"
+                value={riskSettings.maxPortfolioDrawdown || 10.0}
+                onChange={(e) => handleRiskParamChange('maxPortfolioDrawdown', parseFloat(e.target.value))}
+              />
+              <div style={{ fontSize: '9px', color: 'var(--text-secondary)' }}>
+                Circuit breaker deactivates trading if portfolio equity drops {riskSettings.maxPortfolioDrawdown || 10.0}% from peak.
+              </div>
+            </div>
+
+            {/* Volatility ATR Minimum */}
+            <div className="form-group" style={{ marginBottom: '4px' }}>
+              <label className="form-label">
+                <span>Min Volatility ATR %:</span>
+                <span className="val">{riskSettings.volatilityAtrMin !== undefined ? riskSettings.volatilityAtrMin : 0.05}%</span>
+              </label>
+              <input
+                type="range"
+                min="0.01"
+                max="0.50"
+                step="0.01"
+                className="range-input"
+                value={riskSettings.volatilityAtrMin !== undefined ? riskSettings.volatilityAtrMin : 0.05}
+                onChange={(e) => handleRiskParamChange('volatilityAtrMin', parseFloat(e.target.value))}
+              />
+              <div style={{ fontSize: '9px', color: 'var(--text-secondary)' }}>
+                Skips execution if the current ATR percent falls below this limit.
+              </div>
+            </div>
+
+            {/* Bid-Ask Spread Maximum */}
+            <div className="form-group" style={{ marginBottom: '4px' }}>
+              <label className="form-label">
+                <span>Max Bid-Ask Spread %:</span>
+                <span className="val">{riskSettings.volatilitySpreadMax !== undefined ? riskSettings.volatilitySpreadMax : 0.10}%</span>
+              </label>
+              <input
+                type="range"
+                min="0.01"
+                max="0.50"
+                step="0.01"
+                className="range-input"
+                value={riskSettings.volatilitySpreadMax !== undefined ? riskSettings.volatilitySpreadMax : 0.10}
+                onChange={(e) => handleRiskParamChange('volatilitySpreadMax', parseFloat(e.target.value))}
+              />
+              <div style={{ fontSize: '9px', color: 'var(--text-secondary)' }}>
+                Skips trade if bid-ask spread is wider than this threshold.
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Trailing Stop Switch */}
         <div className="switch-group">
           <span className="switch-label" style={{ cursor: 'pointer' }} onClick={() => handleRiskParamChange('trailingStopEnabled', !riskSettings.trailingStopEnabled)}>

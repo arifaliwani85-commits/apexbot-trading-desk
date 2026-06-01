@@ -10,6 +10,7 @@ interface TradeLogsProps {
   latestPrice: number;
   allPositions?: Position[];
   evaluationStates?: Record<string, any>;
+  accountBalance?: number;
 }
 
 export const TradeLogs: React.FC<TradeLogsProps> = ({
@@ -20,6 +21,7 @@ export const TradeLogs: React.FC<TradeLogsProps> = ({
   latestPrice,
   allPositions = [],
   evaluationStates = {},
+  accountBalance = 10000,
 }) => {
   const [activeTab, setActiveTab] = useState<'positions' | 'logs' | 'history' | 'diagnostics'>('positions');
   const logEndRef = useRef<HTMLDivElement>(null);
@@ -84,59 +86,281 @@ export const TradeLogs: React.FC<TradeLogsProps> = ({
         {/* Positions Tab */}
         {activeTab === 'positions' && (
           <div style={{ padding: '16px', height: '100%', display: 'flex', flexDirection: 'column', overflowY: 'auto' }}>
-            {allPositions.length > 0 ? (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-                {allPositions.map((pos) => {
-                  // Determine price to use for live pnl
-                  const currentPriceForPnl = pos.symbol === activePosition?.symbol ? latestPrice : pos.entryPrice;
-                  const diff = pos.type === 'LONG'
-                    ? currentPriceForPnl - pos.entryPrice
-                    : pos.entryPrice - currentPriceForPnl;
-                  const pnlUsd = diff * pos.size * pos.leverage;
-                  const pnlPct = (pnlUsd / (pos.entryPrice * pos.size)) * 100;
-                  
-                  return (
-                    <div
-                      key={pos.id}
-                      style={{
-                        background: 'var(--bg-tertiary)',
-                        border: '1px solid var(--border-color)',
-                        borderRadius: 'var(--radius-md)',
-                        padding: '12px',
-                        display: 'flex',
-                        justifyContent: 'space-between',
-                        alignItems: 'center'
-                      }}
-                    >
-                      <div>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                          <span style={{ fontWeight: 'bold', fontFamily: 'var(--font-mono)' }}>{pos.symbol}</span>
-                          <span className={`badge ${pos.type === 'LONG' ? 'badge-long' : 'badge-short'}`} style={{ fontSize: '9px', padding: '1px 4px' }}>
-                            {pos.type} {pos.leverage}X
-                          </span>
+            {allPositions.length > 0 ? (() => {
+              // Grouping positions
+              const groups: {
+                primary?: Position;
+                hedge?: Position;
+                single?: Position;
+                symbol: string;
+              }[] = [];
+
+              const processedIds = new Set<string>();
+
+              allPositions.forEach(pos => {
+                if (processedIds.has(pos.id)) return;
+
+                if (pos.isHedgedPair) {
+                  if (pos.hedgedRole === 'PRIMARY') {
+                    const pairedHedge = allPositions.find(p => p.id === pos.pairedPositionId);
+                    groups.push({
+                      symbol: pos.symbol,
+                      primary: pos,
+                      hedge: pairedHedge
+                    });
+                    processedIds.add(pos.id);
+                    if (pairedHedge) processedIds.add(pairedHedge.id);
+                  } else {
+                    const pairedPrimary = allPositions.find(p => p.id === pos.pairedPositionId);
+                    if (!pairedPrimary) {
+                      groups.push({
+                        symbol: pos.symbol,
+                        hedge: pos
+                      });
+                      processedIds.add(pos.id);
+                    }
+                  }
+                } else {
+                  groups.push({
+                    symbol: pos.symbol,
+                    single: pos
+                  });
+                  processedIds.add(pos.id);
+                }
+              });
+
+              return (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+                  {groups.map((group, idx) => {
+                    let primaryPnlVal = 0;
+                    let primaryPct = 0;
+                    let hedgePnlVal = 0;
+                    let hedgePct = 0;
+                    let singlePnlVal = 0;
+                    let singlePct = 0;
+
+                    let groupUnrealizedPnl = 0;
+                    let groupRealizedPnl = 0;
+
+                    if (group.single) {
+                      const curPrice = group.single.symbol === activePosition?.symbol ? latestPrice : group.single.entryPrice;
+                      const diff = group.single.type === 'LONG' ? curPrice - group.single.entryPrice : group.single.entryPrice - curPrice;
+                      singlePnlVal = diff * group.single.size * group.single.leverage;
+                      singlePct = (singlePnlVal / (group.single.entryPrice * group.single.size)) * 100;
+                      groupUnrealizedPnl += singlePnlVal;
+                    }
+
+                    if (group.primary) {
+                      const curPrice = group.primary.symbol === activePosition?.symbol ? latestPrice : group.primary.entryPrice;
+                      const diff = group.primary.type === 'LONG' ? curPrice - group.primary.entryPrice : group.primary.entryPrice - curPrice;
+                      primaryPnlVal = diff * group.primary.size * group.primary.leverage;
+                      primaryPct = (primaryPnlVal / (group.primary.entryPrice * group.primary.size)) * 100;
+                      groupUnrealizedPnl += primaryPnlVal;
+                    } else if (group.hedge) {
+                      const cp = closedTrades.find(t => t.id === group.hedge?.pairedPositionId);
+                      if (cp) {
+                        primaryPnlVal = cp.pnl;
+                        primaryPct = cp.pnlPercent;
+                        groupRealizedPnl += cp.pnl;
+                      }
+                    }
+
+                    if (group.hedge) {
+                      const curPrice = group.hedge.symbol === activePosition?.symbol ? latestPrice : group.hedge.entryPrice;
+                      const diff = group.hedge.type === 'LONG' ? curPrice - group.hedge.entryPrice : group.hedge.entryPrice - curPrice;
+                      hedgePnlVal = diff * group.hedge.size * group.hedge.leverage;
+                      hedgePct = (hedgePnlVal / (group.hedge.entryPrice * group.hedge.size)) * 100;
+                      groupUnrealizedPnl += hedgePnlVal;
+                    } else if (group.primary) {
+                      const ch = closedTrades.find(t => t.id === group.primary?.pairedPositionId);
+                      if (ch) {
+                        hedgePnlVal = ch.pnl;
+                        hedgePct = ch.pnlPercent;
+                        groupRealizedPnl += ch.pnl;
+                      }
+                    }
+
+                    const combinedPnl = groupRealizedPnl + groupUnrealizedPnl;
+
+                    let hedgeEfficiency = null;
+                    if (primaryPnlVal < 0) {
+                      hedgeEfficiency = (hedgePnlVal / Math.abs(primaryPnlVal)) * 100;
+                    }
+
+                    let riskExposure = 0;
+                    if (group.single) {
+                      riskExposure = ((group.single.size * group.single.entryPrice) / accountBalance) * 100;
+                    }
+                    if (group.primary) {
+                      riskExposure += ((group.primary.size * group.primary.entryPrice) / accountBalance) * 100;
+                    }
+                    if (group.hedge) {
+                      riskExposure += ((group.hedge.size * group.hedge.entryPrice) / accountBalance) * 100;
+                    }
+
+                    const activeScenario = group.primary?.hedgedScenario || group.hedge?.hedgedScenario || 'NONE';
+                    const isHedged = !!(group.primary || group.hedge);
+
+                    return (
+                      <div
+                        key={idx}
+                        style={{
+                          background: 'var(--bg-tertiary)',
+                          border: '1px solid var(--border-color)',
+                          borderRadius: 'var(--radius-lg)',
+                          padding: '16px',
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: '12px',
+                        }}
+                      >
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                            <span style={{ fontSize: '15px', fontWeight: 'bold', fontFamily: 'var(--font-mono)' }}>{group.symbol}</span>
+                            {isHedged && (
+                              <span className="badge" style={{ background: 'rgba(37, 99, 235, 0.1)', color: 'var(--accent-blue)', fontSize: '9px' }}>
+                                HEDGED PAIR
+                              </span>
+                            )}
+                            {isHedged && activeScenario !== 'NONE' && (
+                              <span className="badge" style={{ background: 'rgba(245, 158, 11, 0.15)', color: 'var(--accent-gold)', fontSize: '9px' }}>
+                                SCENARIO {activeScenario}
+                              </span>
+                            )}
+                          </div>
+
+                          <button
+                            onClick={() => onClosePosition(group.symbol)}
+                            className="btn btn-secondary"
+                            style={{ width: 'auto', padding: '4px 10px', fontSize: '11px', display: 'flex', gap: '4px', alignItems: 'center' }}
+                          >
+                            <X size={12} /> {isHedged ? 'Close Pair' : 'Close Trade'}
+                          </button>
                         </div>
-                        <div style={{ fontSize: '10px', color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)', marginTop: '4px' }}>
-                          Entry: ${pos.entryPrice.toLocaleString(undefined, { minimumFractionDigits: 2 })} | SL: ${pos.stopLoss.toLocaleString(undefined, { minimumFractionDigits: 2 })} | TP: ${pos.takeProfit.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                          {group.single && (
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 10px', background: 'var(--bg-secondary)', borderRadius: 'var(--radius-md)' }}>
+                              <div>
+                                <span className={`badge ${group.single.type === 'LONG' ? 'badge-long' : 'badge-short'}`} style={{ fontSize: '9px', marginRight: '6px' }}>
+                                  {group.single.type} {group.single.leverage}X
+                                </span>
+                                <span style={{ fontSize: '11px', color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)' }}>
+                                  Entry: ${group.single.entryPrice.toLocaleString(undefined, { minimumFractionDigits: 2 })} | SL: ${group.single.stopLoss.toLocaleString()} | TP: ${group.single.takeProfit.toLocaleString()}
+                                </span>
+                              </div>
+                              <span className={singlePnlVal >= 0 ? 'green-text' : 'red-text'} style={{ fontFamily: 'var(--font-mono)', fontWeight: 'bold', fontSize: '12px' }}>
+                                {singlePnlVal >= 0 ? '+' : ''}${singlePnlVal.toFixed(2)} ({singlePnlVal >= 0 ? '+' : ''}{singlePct.toFixed(1)}%)
+                              </span>
+                            </div>
+                          )}
+
+                          {group.primary && (
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 10px', background: 'var(--bg-secondary)', borderRadius: 'var(--radius-md)', borderLeft: '3px solid var(--accent-blue)' }}>
+                              <div>
+                                <span className="badge" style={{ background: 'rgba(37, 99, 235, 0.15)', color: 'var(--accent-blue)', fontSize: '8px', padding: '1px 3px', marginRight: '6px' }}>PRIMARY</span>
+                                <span className={`badge ${group.primary.type === 'LONG' ? 'badge-long' : 'badge-short'}`} style={{ fontSize: '9px', marginRight: '6px' }}>
+                                  {group.primary.type} {group.primary.leverage}X
+                                </span>
+                                <span style={{ fontSize: '11px', color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)' }}>
+                                  Entry: ${group.primary.entryPrice.toLocaleString(undefined, { minimumFractionDigits: 2 })} | SL: ${group.primary.stopLoss.toLocaleString()} | TP: ${group.primary.takeProfit.toLocaleString()}
+                                </span>
+                              </div>
+                              <span className={primaryPnlVal >= 0 ? 'green-text' : 'red-text'} style={{ fontFamily: 'var(--font-mono)', fontWeight: 'bold', fontSize: '12px' }}>
+                                {primaryPnlVal >= 0 ? '+' : ''}${primaryPnlVal.toFixed(2)} ({primaryPnlVal >= 0 ? '+' : ''}{primaryPct.toFixed(1)}%)
+                              </span>
+                            </div>
+                          )}
+                          {!group.primary && isHedged && (
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 10px', background: 'var(--bg-secondary)', borderRadius: 'var(--radius-md)', borderLeft: '3px solid var(--border-color)', opacity: 0.6 }}>
+                              <div>
+                                <span className="badge" style={{ background: 'var(--border-color)', color: 'var(--text-secondary)', fontSize: '8px', padding: '1px 3px', marginRight: '6px' }}>PRIMARY</span>
+                                <span className="badge" style={{ background: 'var(--border-color)', color: 'var(--text-secondary)', fontSize: '9px', marginRight: '6px' }}>CLOSED</span>
+                              </div>
+                              <span className={primaryPnlVal >= 0 ? 'green-text' : 'red-text'} style={{ fontFamily: 'var(--font-mono)', fontWeight: 'bold', fontSize: '12px' }}>
+                                Realized: {primaryPnlVal >= 0 ? '+' : ''}${primaryPnlVal.toFixed(2)}
+                              </span>
+                            </div>
+                          )}
+
+                          {group.hedge && (
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 10px', background: 'var(--bg-secondary)', borderRadius: 'var(--radius-md)', borderLeft: '3px solid var(--accent-gold)' }}>
+                              <div>
+                                <span className="badge" style={{ background: 'rgba(245, 158, 11, 0.15)', color: 'var(--accent-gold)', fontSize: '8px', padding: '1px 3px', marginRight: '6px' }}>HEDGE</span>
+                                <span className={`badge ${group.hedge.type === 'LONG' ? 'badge-long' : 'badge-short'}`} style={{ fontSize: '9px', marginRight: '6px' }}>
+                                  {group.hedge.type} {group.hedge.leverage}X
+                                </span>
+                                <span style={{ fontSize: '11px', color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)' }}>
+                                  Entry: ${group.hedge.entryPrice.toLocaleString(undefined, { minimumFractionDigits: 2 })} | SL: ${group.hedge.stopLoss.toLocaleString()} | TP: ${group.hedge.takeProfit.toLocaleString()}
+                                </span>
+                              </div>
+                              <span className={hedgePnlVal >= 0 ? 'green-text' : 'red-text'} style={{ fontFamily: 'var(--font-mono)', fontWeight: 'bold', fontSize: '12px' }}>
+                                {hedgePnlVal >= 0 ? '+' : ''}${hedgePnlVal.toFixed(2)} ({hedgePnlVal >= 0 ? '+' : ''}{hedgePct.toFixed(1)}%)
+                              </span>
+                            </div>
+                          )}
+                          {!group.hedge && isHedged && (
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 10px', background: 'var(--bg-secondary)', borderRadius: 'var(--radius-md)', borderLeft: '3px solid var(--border-color)', opacity: 0.6 }}>
+                              <div>
+                                <span className="badge" style={{ background: 'var(--border-color)', color: 'var(--text-secondary)', fontSize: '8px', padding: '1px 3px', marginRight: '6px' }}>HEDGE</span>
+                                <span className="badge" style={{ background: 'var(--border-color)', color: 'var(--text-secondary)', fontSize: '9px', marginRight: '6px' }}>CLOSED</span>
+                              </div>
+                              <span className={hedgePnlVal >= 0 ? 'green-text' : 'red-text'} style={{ fontFamily: 'var(--font-mono)', fontWeight: 'bold', fontSize: '12px' }}>
+                                Realized: {hedgePnlVal >= 0 ? '+' : ''}${hedgePnlVal.toFixed(2)}
+                              </span>
+                            </div>
+                          )}
                         </div>
-                      </div>
-                      
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-                        <span className={pnlUsd >= 0 ? 'green-text' : 'red-text'} style={{ fontFamily: 'var(--font-mono)', fontWeight: 'bold', fontSize: '13px' }}>
-                          {pnlUsd >= 0 ? '+' : ''}${pnlUsd.toFixed(2)} ({pnlUsd >= 0 ? '+' : ''}{pnlPct.toFixed(1)}%)
-                        </span>
-                        <button
-                          onClick={() => onClosePosition(pos.symbol)}
-                          className="btn btn-secondary"
-                          style={{ width: 'auto', padding: '2px 6px', fontSize: '10px', display: 'flex', gap: '2px', alignItems: 'center' }}
+
+                        <div
+                          style={{
+                            borderTop: '1px solid var(--border-color)',
+                            paddingTop: '10px',
+                            display: 'grid',
+                            gridTemplateColumns: isHedged ? 'repeat(4, 1fr)' : 'repeat(2, 1fr)',
+                            gap: '8px',
+                            textAlign: 'center',
+                            fontSize: '11px',
+                          }}
                         >
-                          <X size={10} /> Close
-                        </button>
+                          <div>
+                            <div style={{ color: 'var(--text-secondary)', fontSize: '9px', textTransform: 'uppercase' }}>Combined PnL</div>
+                            <span className={combinedPnl >= 0 ? 'green-text' : 'red-text'} style={{ fontFamily: 'var(--font-mono)', fontWeight: 'bold' }}>
+                              {combinedPnl >= 0 ? '+' : ''}${combinedPnl.toFixed(2)}
+                            </span>
+                          </div>
+
+                          {isHedged && (
+                            <>
+                              <div>
+                                <div style={{ color: 'var(--text-secondary)', fontSize: '9px', textTransform: 'uppercase' }}>Realized PnL</div>
+                                <span style={{ fontFamily: 'var(--font-mono)', fontWeight: 'bold', color: groupRealizedPnl >= 0 ? 'var(--accent-green)' : 'var(--accent-red)' }}>
+                                  ${groupRealizedPnl.toFixed(2)}
+                                </span>
+                              </div>
+                              <div>
+                                <div style={{ color: 'var(--text-secondary)', fontSize: '9px', textTransform: 'uppercase' }}>Hedge Efficiency</div>
+                                <span style={{ fontFamily: 'var(--font-mono)', fontWeight: 'bold', color: 'var(--text-primary)' }}>
+                                  {hedgeEfficiency !== null ? `${hedgeEfficiency.toFixed(1)}%` : 'N/A'}
+                                </span>
+                              </div>
+                            </>
+                          )}
+
+                          <div>
+                            <div style={{ color: 'var(--text-secondary)', fontSize: '9px', textTransform: 'uppercase' }}>Risk Exposure</div>
+                            <span style={{ fontFamily: 'var(--font-mono)', fontWeight: 'bold', color: riskExposure > 100 ? 'var(--accent-red)' : 'var(--text-primary)' }}>
+                              {riskExposure.toFixed(1)}%
+                            </span>
+                          </div>
+                        </div>
                       </div>
-                    </div>
-                  );
-                })}
-              </div>
-            ) : activePosition ? (
+                    );
+                  })}
+                </div>
+              );
+            })()
+            : activePosition ? (
               <div
                 style={{
                   background: 'var(--bg-tertiary)',

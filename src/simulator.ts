@@ -127,163 +127,317 @@ export function runBacktest(
   let maxDrawdown = 0;
   
   const trades: Position[] = [];
-  let activePosition: Position | null = null;
+  let activePositions: Position[] = [];
   
   // We start the backtest after 200 candles to ensure indicators are stabilized
   const startIdx = Math.max(200, Math.min(data.length - 10, 200));
 
   for (let i = startIdx; i < data.length; i++) {
     const currentCandle = data[i];
+    const currentPrice = currentCandle.close;
     
     // Calculate floating equity
-    const currentPrice = currentCandle.close;
     let equity = balance;
-    if (activePosition) {
-      const priceDiff = activePosition.type === 'LONG' 
-        ? currentPrice - activePosition.entryPrice 
-        : activePosition.entryPrice - currentPrice;
-      const tradePnl = priceDiff * activePosition.size * activePosition.leverage;
-      equity = balance + tradePnl;
+    for (const pos of activePositions) {
+      const priceDiff = pos.type === 'LONG' 
+        ? currentPrice - pos.entryPrice 
+        : pos.entryPrice - currentPrice;
+      const tradePnl = priceDiff * pos.size * pos.leverage;
+      equity += tradePnl;
     }
     
     maxEquity = Math.max(maxEquity, equity);
     const dd = ((maxEquity - equity) / maxEquity) * 100;
     maxDrawdown = Math.max(maxDrawdown, dd);
 
-    // 2. If there is an active trade, check if it hits stops or targets
-    if (activePosition) {
-      const pos = activePosition;
-      let exitPrice = 0;
-      let exitReason: 'SL' | 'TP' | 'TRAILING_STOP' | 'MANUAL' | undefined;
-
-      // Update max/min prices for trailing stop calculations
-      if (pos.type === 'LONG') {
-        pos.maxObservedPrice = Math.max(pos.maxObservedPrice || pos.entryPrice, currentCandle.high);
-      } else {
-        pos.minObservedPrice = Math.min(pos.minObservedPrice || pos.entryPrice, currentCandle.low);
-      }
-
-      // Check Trailing Stop adjustment
-      if (riskSettings.trailingStopEnabled) {
-        const slDistance = Math.abs(pos.entryPrice - pos.stopLoss);
-        
-        if (pos.type === 'LONG') {
-          const profitLevel = pos.entryPrice + slDistance * riskSettings.trailingStopTrigger;
-          // If price went past the trigger level, move SL to entry + locking in half of risk distance
-          if ((pos.maxObservedPrice || 0) > profitLevel) {
-            const newSL = pos.entryPrice + slDistance * 0.2; // entry + 20% risk distance (risk-free!)
-            pos.stopLoss = Math.max(pos.stopLoss, newSL);
-          }
-        } else {
-          const profitLevel = pos.entryPrice - slDistance * riskSettings.trailingStopTrigger;
-          if ((pos.minObservedPrice || Infinity) < profitLevel) {
-            const newSL = pos.entryPrice - slDistance * 0.2;
-            pos.stopLoss = Math.min(pos.stopLoss, newSL);
-          }
-        }
-      }
-
-      // Check exit conditions on current candle range
-      if (pos.type === 'LONG') {
-        if (currentCandle.low <= pos.stopLoss) {
-          exitPrice = pos.stopLoss;
-          exitReason = riskSettings.trailingStopEnabled && exitPrice > pos.entryPrice ? 'TRAILING_STOP' : 'SL';
-        } else if (currentCandle.high >= pos.takeProfit) {
-          exitPrice = pos.takeProfit;
-          exitReason = 'TP';
-        }
-      } else { // SHORT
-        if (currentCandle.high >= pos.stopLoss) {
-          exitPrice = pos.stopLoss;
-          exitReason = riskSettings.trailingStopEnabled && exitPrice < pos.entryPrice ? 'TRAILING_STOP' : 'SL';
-        } else if (currentCandle.low <= pos.takeProfit) {
-          exitPrice = pos.takeProfit;
-          exitReason = 'TP';
-        }
-      }
-
-      if (exitReason) {
-        // Close position
-        const pnl = pos.type === 'LONG'
-          ? (exitPrice - pos.entryPrice) * pos.size * pos.leverage
-          : (pos.entryPrice - exitPrice) * pos.size * pos.leverage;
-        
+    // Enforce portfolio drawdown limit
+    const portfolioDrawdownLimit = riskSettings.maxPortfolioDrawdown || 10.0;
+    if (dd >= portfolioDrawdownLimit) {
+      // Force close all positions
+      for (const pos of activePositions) {
+        const priceDiff = pos.type === 'LONG' 
+          ? currentPrice - pos.entryPrice 
+          : pos.entryPrice - currentPrice;
+        const pnl = priceDiff * pos.size * pos.leverage;
         balance += pnl;
         
-        const closedPos: Position = {
+        trades.push({
           ...pos,
           status: 'CLOSED',
-          exitPrice,
+          exitPrice: currentPrice,
           exitTime: currentCandle.time,
-          exitReason,
+          exitReason: 'DRAWDOWN',
           pnl,
           pnlPercent: (pnl / (pos.entryPrice * pos.size)) * 100,
-        };
-        
-        trades.push(closedPos);
-        activePosition = null;
+        });
       }
+      activePositions = [];
+      maxDrawdown = Math.max(maxDrawdown, dd);
+      break; // Stop backtest
+    }
+
+    // 2. If there are active positions, check if they hit stops or targets
+    if (activePositions.length > 0) {
+      const toCloseIds: string[] = [];
+      const updatedPositions: Position[] = [];
+
+      // First pass: Update indicators, maxObservedPrice, minObservedPrice and calculate floating PnL
+      for (const pos of activePositions) {
+        if (pos.type === 'LONG') {
+          pos.maxObservedPrice = Math.max(pos.maxObservedPrice || pos.entryPrice, currentCandle.high);
+        } else {
+          pos.minObservedPrice = Math.min(pos.minObservedPrice || pos.entryPrice, currentCandle.low);
+        }
+
+        const priceDiff = pos.type === 'LONG'
+          ? currentPrice - pos.entryPrice
+          : pos.entryPrice - currentPrice;
+        pos.pnl = priceDiff * pos.size * pos.leverage;
+        pos.pnlPercent = (pos.pnl / (pos.entryPrice * pos.size)) * 100;
+        pos.maxLeveragedPnL = Math.max(pos.maxLeveragedPnL || 0, pos.pnlPercent);
+      }
+
+      // Second pass: Evaluate exits
+      for (const pos of activePositions) {
+        if (toCloseIds.includes(pos.id)) continue;
+
+        let exitPrice = 0;
+        let exitReason: 'SL' | 'TP' | 'TRAILING_STOP' | 'MANUAL' | 'DRAWDOWN' | undefined;
+
+        if (pos.isHedgedPair) {
+          const paired = activePositions.find(p => p.id === pos.pairedPositionId && !toCloseIds.includes(p.id));
+          const role = pos.hedgedRole;
+
+          if (role === 'PRIMARY') {
+            // SCENARIO A: Primary reaches +50% PnL -> Close primary, flag hedge as Scenario A
+            if (pos.pnlPercent >= 50) {
+              exitPrice = currentPrice;
+              exitReason = 'TP';
+              toCloseIds.push(pos.id);
+              if (paired) {
+                paired.hedgedScenario = 'A';
+              }
+            }
+            // SCENARIO C: Primary reaches +60% PnL -> Trailing Profit mode
+            else if (pos.pnlPercent >= 60 || pos.hedgedScenario === 'C') {
+              pos.hedgedScenario = 'C';
+              if (paired) paired.hedgedScenario = 'C';
+
+              // Trailing stop checks: lock 30% of peak leveraged PnL
+              if (pos.pnlPercent < 0.30 * (pos.maxLeveragedPnL || 0)) {
+                exitPrice = currentPrice;
+                exitReason = 'TRAILING_STOP';
+                toCloseIds.push(pos.id);
+              }
+            }
+            // SCENARIO B: If hedge was closed in Scenario B, primary scenario is B
+            else if (pos.hedgedScenario === 'B') {
+              if (pos.pnlPercent >= 40) {
+                exitPrice = currentPrice;
+                exitReason = 'TP';
+                toCloseIds.push(pos.id);
+              }
+            }
+          } else if (role === 'HEDGE') {
+            // SCENARIO A: If primary closed in Scenario A, hedge's scenario is A
+            if (pos.hedgedScenario === 'A') {
+              if (pos.pnlPercent >= 10) {
+                exitPrice = currentPrice;
+                exitReason = 'TP';
+                toCloseIds.push(pos.id);
+              } else if (pos.pnlPercent <= -10) {
+                exitPrice = currentPrice;
+                exitReason = 'SL';
+                toCloseIds.push(pos.id);
+              }
+            }
+            // SCENARIO B: Hedge reaches +70% PnL and primary is losing -> Close hedge, flag primary as Scenario B
+            else if (pos.pnlPercent >= 70 && paired && paired.pnlPercent < 0) {
+              exitPrice = currentPrice;
+              exitReason = 'TP';
+              toCloseIds.push(pos.id);
+              paired.hedgedScenario = 'B';
+            }
+            // SCENARIO C: Exit hedge if <= -80% PnL or >= +10% PnL
+            else if (pos.hedgedScenario === 'C') {
+              if (pos.pnlPercent <= -80) {
+                exitPrice = currentPrice;
+                exitReason = 'SL';
+                toCloseIds.push(pos.id);
+              } else if (pos.pnlPercent >= 10) {
+                exitPrice = currentPrice;
+                exitReason = 'TP';
+                toCloseIds.push(pos.id);
+              }
+            }
+          }
+        }
+
+        // Standard exit conditions if not exited by scenario
+        if (!exitReason) {
+          if (pos.type === 'LONG') {
+            if (currentCandle.low <= pos.stopLoss) {
+              exitPrice = pos.stopLoss;
+              exitReason = riskSettings.trailingStopEnabled && exitPrice > pos.entryPrice ? 'TRAILING_STOP' : 'SL';
+              toCloseIds.push(pos.id);
+            } else if (currentCandle.high >= pos.takeProfit) {
+              exitPrice = pos.takeProfit;
+              exitReason = 'TP';
+              toCloseIds.push(pos.id);
+            }
+          } else { // SHORT
+            if (currentCandle.high >= pos.stopLoss) {
+              exitPrice = pos.stopLoss;
+              exitReason = riskSettings.trailingStopEnabled && exitPrice < pos.entryPrice ? 'TRAILING_STOP' : 'SL';
+              toCloseIds.push(pos.id);
+            } else if (currentCandle.low <= pos.takeProfit) {
+              exitPrice = pos.takeProfit;
+              exitReason = 'TP';
+              toCloseIds.push(pos.id);
+            }
+          }
+        }
+
+        if (exitReason) {
+          const pnl = pos.type === 'LONG'
+            ? (exitPrice - pos.entryPrice) * pos.size * pos.leverage
+            : (pos.entryPrice - exitPrice) * pos.size * pos.leverage;
+          
+          balance += pnl;
+          
+          trades.push({
+            ...pos,
+            status: 'CLOSED',
+            exitPrice,
+            exitTime: currentCandle.time,
+            exitReason,
+            pnl,
+            pnlPercent: (pnl / (pos.entryPrice * pos.size)) * 100,
+          });
+        } else {
+          updatedPositions.push(pos);
+        }
+      }
+
+      activePositions = updatedPositions;
     }
 
     // 3. If no active position, check for a new signal
-    if (!activePosition) {
+    const activeSymbolsCount = Array.from(new Set(activePositions.map(p => p.symbol))).length;
+    if (activeSymbolsCount < (riskSettings.maxConcurrentPositions || 3)) {
       // Evaluate strategy on historical data slice
       const historySlice = data.slice(0, i + 1);
       const decision = evaluateStrategy(historySlice, stratSettings);
       
       if (decision.signal) {
-        const atrValue = currentCandle.atr || (currentCandle.high - currentCandle.low);
-        const slDistance = atrValue * riskSettings.atrMultiplier;
-        
-        let slPrice = 0;
-        let tpPrice = 0;
-        
-        if (decision.signal === 'BUY') {
-          slPrice = currentPrice - slDistance;
-          tpPrice = currentPrice + slDistance * riskSettings.riskRewardRatio;
-        } else { // SELL (Short entry)
-          slPrice = currentPrice + slDistance;
-          tpPrice = currentPrice - slDistance * riskSettings.riskRewardRatio;
-        }
+        const atrValue = currentCandle.atr || (currentCandle.high - currentCandle.low) || 1.0;
+        const atrPercent = (atrValue / currentPrice) * 100;
+        const atrMin = riskSettings.volatilityAtrMin !== undefined ? riskSettings.volatilityAtrMin : 0.05;
 
-        // Apply The 1% - 2% Risk Rule to size the position
-        // Max dollar loss on this trade is balance * (riskPercent / 100)
-        const maxLossAllowed = balance * (riskSettings.riskPercent / 100);
-        
-        // Loss per unit coin = Stop loss distance
-        let positionSize = maxLossAllowed / slDistance;
-        
-        // Ensure size doesn't exceed maximum leverage capacity
-        const totalCapitalRequired = positionSize * currentPrice;
-        const maxAllowedLeveragedExposure = balance * riskSettings.leverage;
-        
-        if (totalCapitalRequired > maxAllowedLeveragedExposure) {
-          positionSize = maxAllowedLeveragedExposure / currentPrice;
-        }
+        // Volatility Protection check (ATR min)
+        if (atrPercent >= atrMin) {
+          const slDistance = atrValue * riskSettings.atrMultiplier;
+          
+          let primaryType: 'LONG' | 'SHORT' = decision.signal === 'BUY' ? 'LONG' : 'SHORT';
+          let hedgeType: 'LONG' | 'SHORT' = primaryType === 'LONG' ? 'SHORT' : 'LONG';
 
-        activePosition = {
-          id: `backtest_${i}`,
-          type: decision.signal === 'BUY' ? 'LONG' : 'SHORT',
-          symbol: 'MOCKUSDT',
-          entryPrice: currentPrice,
-          entryTime: currentCandle.time,
-          size: positionSize,
-          leverage: riskSettings.leverage,
-          stopLoss: parseFloat(slPrice.toFixed(2)),
-          takeProfit: parseFloat(tpPrice.toFixed(2)),
-          pnl: 0,
-          pnlPercent: 0,
-          status: 'OPEN',
-          maxObservedPrice: currentPrice,
-          minObservedPrice: currentPrice,
-        };
+          // Apply The 1% Risk Rule to size the position
+          const maxLossAllowed = balance * (riskSettings.riskPercent / 100);
+          let positionSize = maxLossAllowed / slDistance;
+          
+          // Ensure size doesn't exceed maximum leverage capacity
+          const totalCapitalRequired = positionSize * currentPrice;
+          const maxAllowedExposure = balance * riskSettings.leverage;
+          
+          if (totalCapitalRequired > maxAllowedExposure) {
+            positionSize = maxAllowedExposure / currentPrice;
+          }
+
+          const primaryId = `backtest_primary_${i}`;
+          const hedgeId = `backtest_hedge_${i}`;
+
+          if (riskSettings.hedgedDualExecutionEnabled) {
+            let primarySl = primaryType === 'LONG' ? currentPrice - slDistance : currentPrice + slDistance;
+            let primaryTp = primaryType === 'LONG' ? currentPrice + slDistance * riskSettings.riskRewardRatio : currentPrice - slDistance * riskSettings.riskRewardRatio;
+
+            // Primary Position
+            const primaryPos: Position = {
+              id: primaryId,
+              type: primaryType,
+              symbol: 'MOCKUSDT',
+              entryPrice: currentPrice,
+              entryTime: currentCandle.time,
+              size: positionSize,
+              leverage: riskSettings.leverage,
+              stopLoss: parseFloat(primarySl.toFixed(2)),
+              takeProfit: parseFloat(primaryTp.toFixed(2)),
+              pnl: 0,
+              pnlPercent: 0,
+              status: 'OPEN',
+              maxObservedPrice: currentPrice,
+              minObservedPrice: currentPrice,
+              isHedgedPair: true,
+              hedgedRole: 'PRIMARY',
+              hedgedScenario: 'NONE',
+              pairedPositionId: hedgeId,
+              maxLeveragedPnL: 0,
+            };
+
+            // Hedge Position
+            let hedgeSl = hedgeType === 'LONG' ? currentPrice - slDistance : currentPrice + slDistance;
+            let hedgeTp = hedgeType === 'LONG' ? currentPrice + slDistance * riskSettings.riskRewardRatio : currentPrice - slDistance * riskSettings.riskRewardRatio;
+
+            const hedgePos: Position = {
+              id: hedgeId,
+              type: hedgeType,
+              symbol: 'MOCKUSDT',
+              entryPrice: currentPrice,
+              entryTime: currentCandle.time,
+              size: positionSize,
+              leverage: Math.max(1, Math.round(riskSettings.leverage / 2)),
+              stopLoss: parseFloat(hedgeSl.toFixed(2)),
+              takeProfit: parseFloat(hedgeTp.toFixed(2)),
+              pnl: 0,
+              pnlPercent: 0,
+              status: 'OPEN',
+              maxObservedPrice: currentPrice,
+              minObservedPrice: currentPrice,
+              isHedgedPair: true,
+              hedgedRole: 'HEDGE',
+              hedgedScenario: 'NONE',
+              pairedPositionId: primaryId,
+              maxLeveragedPnL: 0,
+            };
+
+            activePositions.push(primaryPos, hedgePos);
+          } else {
+            let slPrice = primaryType === 'LONG' ? currentPrice - slDistance : currentPrice + slDistance;
+            let tpPrice = primaryType === 'LONG' ? currentPrice + slDistance * riskSettings.riskRewardRatio : currentPrice - slDistance * riskSettings.riskRewardRatio;
+
+            activePositions.push({
+              id: `backtest_single_${i}`,
+              type: primaryType,
+              symbol: 'MOCKUSDT',
+              entryPrice: currentPrice,
+              entryTime: currentCandle.time,
+              size: positionSize,
+              leverage: riskSettings.leverage,
+              stopLoss: parseFloat(slPrice.toFixed(2)),
+              takeProfit: parseFloat(tpPrice.toFixed(2)),
+              pnl: 0,
+              pnlPercent: 0,
+              status: 'OPEN',
+              maxObservedPrice: currentPrice,
+              minObservedPrice: currentPrice,
+            });
+          }
+        }
       }
     }
   }
 
-  // Force close any open position at the end of simulation
-  if (activePosition) {
-    const pos = activePosition;
+  // Force close any open positions at the end of simulation
+  for (const pos of activePositions) {
     const finalPrice = data[data.length - 1].close;
     const pnl = pos.type === 'LONG'
       ? (finalPrice - pos.entryPrice) * pos.size * pos.leverage

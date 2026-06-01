@@ -220,6 +220,10 @@ function getOrCreateSession(username) {
       leverage: 1,
       maxConcurrentPositions: 3,
       partialTakeProfitEnabled: true,
+      hedgedDualExecutionEnabled: true,
+      maxPortfolioDrawdown: 10.0,
+      volatilityAtrMin: 0.05,
+      volatilitySpreadMax: 0.1,
     },
     addLog: function(text, type = 'info') {
       const log = {
@@ -1346,16 +1350,102 @@ app.post('/api/toggle-bot', requireAuth, (req, res) => {
 });
 
 // --- HELPER EXECUTION ROUTINES ---
-async function executeCloseOrder(session, symbol, reason, customSize = null) {
-  const pos = session.activePositions[symbol];
+async function checkVolatilityAndLiquidity(session, symbol, latestCandle) {
+  const price = latestCandle.close;
+  const atrValue = latestCandle.atr || (latestCandle.high - latestCandle.low) || 1.0;
+  const atrPercent = (atrValue / price) * 100;
+  
+  const minAtr = session.riskSettings.volatilityAtrMin !== undefined ? session.riskSettings.volatilityAtrMin : 0.05;
+  if (atrPercent < minAtr) {
+    return { ok: false, reason: `ATR volatility ${atrPercent.toFixed(3)}% < minimum ${minAtr}%` };
+  }
+
+  if (session.exchangeInstance) {
+    try {
+      const marketSymbol = getMarketSymbol(session, symbol);
+      const limit = 20;
+      const ob = await session.exchangeInstance.fetchOrderBook(marketSymbol, limit);
+      const bestBid = ob.bids && ob.bids.length > 0 ? ob.bids[0][0] : price;
+      const bestAsk = ob.asks && ob.asks.length > 0 ? ob.asks[0][0] : price;
+      const spreadPercent = ((bestAsk - bestBid) / bestBid) * 100;
+      const maxSpread = session.riskSettings.volatilitySpreadMax !== undefined ? session.riskSettings.volatilitySpreadMax : 0.1;
+      
+      if (spreadPercent > maxSpread) {
+        return { ok: false, reason: `Bid-Ask spread ${spreadPercent.toFixed(3)}% > maximum ${maxSpread}%` };
+      }
+
+      // Check liquidity: sum bids and asks volume within 1% of the mid price
+      const upperLimit = price * 1.01;
+      const lowerLimit = price * 0.99;
+      
+      let totalBidVolumeUsd = 0;
+      if (ob.bids) {
+        for (const [bidPrice, bidSize] of ob.bids) {
+          if (bidPrice >= lowerLimit) {
+            totalBidVolumeUsd += bidPrice * bidSize;
+          } else {
+            break;
+          }
+        }
+      }
+
+      let totalAskVolumeUsd = 0;
+      if (ob.asks) {
+        for (const [askPrice, askSize] of ob.asks) {
+          if (askPrice <= upperLimit) {
+            totalAskVolumeUsd += askPrice * askSize;
+          } else {
+            break;
+          }
+        }
+      }
+
+      const cumulativeLiquidityUsd = totalBidVolumeUsd + totalAskVolumeUsd;
+      const minLiquidityUsd = 20000; // $20,000 minimum depth in 1% range
+      if (cumulativeLiquidityUsd < minLiquidityUsd) {
+        return { ok: false, reason: `Orderbook depth within 1% is $${cumulativeLiquidityUsd.toFixed(2)} < minimum $${minLiquidityUsd}` };
+      }
+    } catch (obErr) {
+      session.addLog(`Volatility Warning: Failed to fetch order book details for ${symbol}: ${obErr.message}. Proceeding with ATR check only.`, 'warning');
+    }
+  }
+
+  return { ok: true };
+}
+
+async function verifyHedgeMode(session, symbol) {
+  if (!session.exchangeInstance) return true; // mock mode
+  try {
+    if (!session.isHedgeMode) {
+      session.addLog(`Exchange is currently in One-Way mode. Attempting to switch to Hedge Mode for Bybit...`, 'info');
+      try {
+        const marketSymbol = getMarketSymbol(session, symbol);
+        await session.exchangeInstance.setPositionMode(true, marketSymbol);
+        session.isHedgeMode = true;
+        session.addLog(`Successfully set Hedge Mode on Bybit for ${symbol}.`, 'success');
+      } catch (switchErr) {
+        // Some accounts have it globally set or require specific symbol param
+        session.addLog(`Note: Direct Hedge Mode switch returned: ${switchErr.message}.`, 'warning');
+      }
+    }
+    return true;
+  } catch (err) {
+    session.addLog(`Hedge Mode Error: Exchange does not support Hedge Mode or setting failed: ${err.message}`, 'danger');
+    return false;
+  }
+}
+
+async function executeCloseOrder(session, symbolKey, reason, customSize = null) {
+  const pos = session.activePositions[symbolKey];
   if (!pos) return;
 
+  const cleanSymbol = pos.symbol;
   const closeSide = pos.type === 'LONG' ? 'sell' : 'buy';
   const sizeToClose = customSize !== null ? customSize : pos.size;
-  const tickerPrice = session.lastTickPrices[symbol] || pos.entryPrice;
+  const tickerPrice = session.lastTickPrices[cleanSymbol] || pos.entryPrice;
 
-  const marketSymbol = getMarketSymbol(session, symbol);
-  session.addLog(`Sending Close Order (${closeSide.toUpperCase()}) on Exchange for ${sizeToClose.toFixed(4)} ${symbol.split('/')[0]}...`, 'info');
+  const marketSymbol = getMarketSymbol(session, cleanSymbol);
+  session.addLog(`Sending Close Order (${closeSide.toUpperCase()}) on Exchange for ${sizeToClose.toFixed(4)} ${cleanSymbol.split('/')[0]}...`, 'info');
 
   try {
     let fillPrice = tickerPrice;
@@ -1380,7 +1470,7 @@ async function executeCloseOrder(session, symbol, reason, customSize = null) {
       // Place real market order on exchange to close
       const order = await safeCreateMarketOrder(session.exchangeInstance, marketSymbol, closeSide, finalCloseSize, closeParams, (txt, typ) => session.addLog(txt, typ));
       fillPrice = order.price || order.average || tickerPrice;
-      session.addLog(`Exchange Fill success for ${symbol}. Closed size ${sizeToClose.toFixed(4)} at average price $${fillPrice}.`, 'success');
+      session.addLog(`Exchange Fill success for ${cleanSymbol}. Closed size ${sizeToClose.toFixed(4)} at average price $${fillPrice}.`, 'success');
     } else {
       session.addLog(`Simulation Note: Exchange client disconnected. Filled closing order locally at ticker price.`, 'warning');
     }
@@ -1408,10 +1498,10 @@ async function executeCloseOrder(session, symbol, reason, customSize = null) {
       };
 
       session.closedTrades.push(closedPos);
-      session.activePositions[symbol] = null;
+      session.activePositions[symbolKey] = null;
 
       // Track the exit timestamp for the 3-candle cooldown
-      session.cooldowns[symbol] = Date.now();
+      session.cooldowns[cleanSymbol] = Date.now();
 
       // Save closedTrades to profile db
       const profile = loadUserProfile(session.username);
@@ -1421,8 +1511,8 @@ async function executeCloseOrder(session, symbol, reason, customSize = null) {
       }
 
       const summaryMsg = pnl >= 0
-        ? `📈 Trade Closed [${reason}] for ${symbol}: Profit: +$${pnl.toFixed(2)} (${closedPos.pnlPercent.toFixed(2)}%)`
-        : `📉 Trade Closed [${reason}] for ${symbol}: Loss: -$${Math.abs(pnl).toFixed(2)} (${closedPos.pnlPercent.toFixed(2)}%)`;
+        ? `📈 Trade Closed [${reason}] for ${cleanSymbol} (${pos.type}): Profit: +$${pnl.toFixed(2)} (${closedPos.pnlPercent.toFixed(2)}%)`
+        : `📉 Trade Closed [${reason}] for ${cleanSymbol} (${pos.type}): Loss: -$${Math.abs(pnl).toFixed(2)} (${closedPos.pnlPercent.toFixed(2)}%)`;
 
       session.addLog(summaryMsg, pnl >= 0 ? 'success' : 'danger');
     }
@@ -1431,7 +1521,7 @@ async function executeCloseOrder(session, symbol, reason, customSize = null) {
       session.isHedgeMode = !session.isHedgeMode;
       session.addLog(`Close order failed due to position mode mismatch. Automatically switched Hedge Mode setting to: ${session.isHedgeMode}.`, 'warning');
     }
-    session.addLog(`Failed to close position on exchange for ${symbol}: ${err.message}`, 'danger');
+    session.addLog(`Failed to close position on exchange for ${cleanSymbol}: ${err.message}`, 'danger');
     throw err;
   }
 }
@@ -1471,6 +1561,8 @@ setInterval(async () => {
       });
 
       const currentEquity = exchangeBalance + netUnrealizedPnL;
+      session.maxEquity = Math.max(session.maxEquity || currentEquity, currentEquity);
+
       let drawdownPercent = 0;
       if (session.dailyStartEquity && session.dailyStartEquity > 0) {
         const pnl = currentEquity - session.dailyStartEquity;
@@ -1479,11 +1571,29 @@ setInterval(async () => {
         }
       }
 
-      // Circuit Breaker activation
-      if (drawdownPercent >= session.riskSettings.maxDailyDrawdown && !session.circuitBreakerTriggered) {
+      let portfolioDrawdownPercent = 0;
+      if (session.maxEquity > 0) {
+        portfolioDrawdownPercent = ((session.maxEquity - currentEquity) / session.maxEquity) * 100;
+      }
+
+      // Circuit Breaker activation (Daily and Portfolio)
+      const maxDailyDD = session.riskSettings.maxDailyDrawdown;
+      const maxPortfolioDD = session.riskSettings.maxPortfolioDrawdown || 10.0;
+      let triggeredBreaker = false;
+      let breakerReason = '';
+
+      if (drawdownPercent >= maxDailyDD) {
+        triggeredBreaker = true;
+        breakerReason = `Daily Max Drawdown limit (${maxDailyDD}%) hit! (Current: -${drawdownPercent.toFixed(2)}%)`;
+      } else if (portfolioDrawdownPercent >= maxPortfolioDD) {
+        triggeredBreaker = true;
+        breakerReason = `Portfolio Max Drawdown limit (${maxPortfolioDD}%) hit! (Current: -${portfolioDrawdownPercent.toFixed(2)}%)`;
+      }
+
+      if (triggeredBreaker && !session.circuitBreakerTriggered) {
         session.circuitBreakerTriggered = true;
         session.botActive = false;
-        session.addLog(`[CRITICAL] Daily Max Drawdown limit (${session.riskSettings.maxDailyDrawdown}%) hit! (Current: -${drawdownPercent.toFixed(2)}%). Triggering Emergency Circuit Breaker.`, 'danger');
+        session.addLog(`[CRITICAL] ${breakerReason}. Triggering Emergency Circuit Breaker.`, 'danger');
 
         // Save status to db
         const profile = loadUserProfile(session.username);
@@ -1493,10 +1603,10 @@ setInterval(async () => {
         }
 
         // Close all active positions
-        for (const sym of session.activeSymbols) {
-          if (session.activePositions[sym]) {
-            session.addLog(`Circuit Breaker: Market closing position for ${sym}...`, 'warning');
-            await executeCloseOrder(session, sym, 'DRAWDOWN');
+        for (const k of Object.keys(session.activePositions)) {
+          if (session.activePositions[k]) {
+            session.addLog(`Circuit Breaker: Market closing position for ${k}...`, 'warning');
+            await executeCloseOrder(session, k, 'DRAWDOWN');
           }
         }
         continue;
@@ -1505,7 +1615,9 @@ setInterval(async () => {
       if (session.circuitBreakerTriggered || !session.botActive) continue;
 
       // Evaluate all active symbols in the bot's basket if bot is active, otherwise just the currently viewed symbol and active positions
-      const activePositionsSymbols = Object.keys(session.activePositions).filter(k => session.activePositions[k]);
+      const activePositionsSymbols = Object.keys(session.activePositions)
+        .filter(k => session.activePositions[k])
+        .map(k => session.activePositions[k].symbol);
       const symbolsToProcess = session.botActive
         ? Array.from(new Set([...session.activeSymbols, ...activePositionsSymbols])).filter(Boolean)
         : Array.from(new Set([session.currentSymbol || 'BTC/USDT', ...activePositionsSymbols])).filter(Boolean);
@@ -1529,7 +1641,8 @@ setInterval(async () => {
             const side = p.side ? p.side.toUpperCase() : '';
             const contracts = parseFloat(p.contracts || p.size || 0);
             if (contracts > 0 && (side === 'LONG' || side === 'SHORT' || side === 'BUY' || side === 'SELL')) {
-              exchangePositionsMap[baseSymbol] = p;
+              const sideKey = (side === 'LONG' || side === 'BUY') ? 'LONG' : 'SHORT';
+              exchangePositionsMap[`${baseSymbol}_${sideKey}`] = p;
             }
           }
         }
@@ -1561,40 +1674,47 @@ setInterval(async () => {
           session.lastTickPrices[symbol] = tickerPrice;
 
           // Sync position state with the exchange
-          const exPos = exchangePositionsMap[symbol];
-          let pos = session.activePositions[symbol];
+          const keysToSync = [`${symbol}_LONG`, `${symbol}_SHORT`];
+          for (const key of keysToSync) {
+            const exPos = exchangePositionsMap[key];
+            let pos = session.activePositions[key];
 
-          if (exPos) {
-            const posType = (exPos.side.toUpperCase() === 'LONG' || exPos.side.toUpperCase() === 'BUY') ? 'LONG' : 'SHORT';
-            const exSize = parseFloat(exPos.contracts || exPos.size || 0);
+            if (exPos) {
+              const posType = key.endsWith('LONG') ? 'LONG' : 'SHORT';
+              const exSize = parseFloat(exPos.contracts || exPos.size || 0);
 
-            if (!pos || pos.type !== posType || Math.abs(pos.size - exSize) > 0.0001) {
-              pos = {
-                id: pos ? pos.id : `restored_${Date.now()}`,
-                type: posType,
-                symbol: symbol,
-                entryPrice: parseFloat(exPos.entryPrice || tickerPrice),
-                entryTime: pos ? pos.entryTime : Date.now(),
-                size: exSize,
-                leverage: parseFloat(exPos.leverage || 1),
-                stopLoss: pos ? pos.stopLoss : parseFloat((exPos.entryPrice * (posType === 'LONG' ? 0.95 : 1.05)).toFixed(2)),
-                takeProfit: pos ? pos.takeProfit : parseFloat((exPos.entryPrice * (posType === 'LONG' ? 1.10 : 0.90)).toFixed(2)),
-                target1Price: pos ? pos.target1Price : parseFloat((exPos.entryPrice * (posType === 'LONG' ? 1.075 : 0.925)).toFixed(2)),
-                halfClosed: pos ? pos.halfClosed : false,
-                pnl: parseFloat(exPos.unrealizedPnl || 0),
-                pnlPercent: parseFloat(exPos.percentage || 0),
-                status: 'OPEN',
-                maxObservedPrice: pos ? pos.maxObservedPrice : parseFloat(exPos.entryPrice || tickerPrice),
-                minObservedPrice: pos ? pos.minObservedPrice : parseFloat(exPos.entryPrice || tickerPrice),
-              };
-              session.activePositions[symbol] = pos;
-              session.addLog(`Synced active ${posType} position for ${symbol} from exchange (Size: ${exSize}).`, 'info');
-            }
-          } else {
-            if (pos) {
-              session.addLog(`Position for ${symbol} closed externally. Clearing local status.`, 'warning');
-              session.activePositions[symbol] = null;
-              pos = null;
+              if (!pos || pos.type !== posType || Math.abs(pos.size - exSize) > 0.0001) {
+                pos = {
+                  id: pos ? pos.id : `restored_${Date.now()}`,
+                  type: posType,
+                  symbol: symbol,
+                  entryPrice: parseFloat(exPos.entryPrice || tickerPrice),
+                  entryTime: pos ? pos.entryTime : Date.now(),
+                  size: exSize,
+                  leverage: parseFloat(exPos.leverage || 1),
+                  stopLoss: pos ? pos.stopLoss : parseFloat((exPos.entryPrice * (posType === 'LONG' ? 0.95 : 1.05)).toFixed(2)),
+                  takeProfit: pos ? pos.takeProfit : parseFloat((exPos.entryPrice * (posType === 'LONG' ? 1.10 : 0.90)).toFixed(2)),
+                  target1Price: pos ? pos.target1Price : parseFloat((exPos.entryPrice * (posType === 'LONG' ? 1.075 : 0.925)).toFixed(2)),
+                  halfClosed: pos ? pos.halfClosed : false,
+                  pnl: parseFloat(exPos.unrealizedPnl || 0),
+                  pnlPercent: parseFloat(exPos.percentage || 0),
+                  status: 'OPEN',
+                  maxObservedPrice: pos ? pos.maxObservedPrice : parseFloat(exPos.entryPrice || tickerPrice),
+                  minObservedPrice: pos ? pos.minObservedPrice : parseFloat(exPos.entryPrice || tickerPrice),
+                  isHedgedPair: session.riskSettings.hedgedDualExecutionEnabled,
+                  hedgedRole: pos ? pos.hedgedRole : (posType === 'LONG' ? 'PRIMARY' : 'HEDGE'),
+                  hedgedScenario: pos ? pos.hedgedScenario : 'NONE',
+                  pairedPositionId: pos ? pos.pairedPositionId : null,
+                  maxLeveragedPnL: pos ? pos.maxLeveragedPnL : 0,
+                };
+                session.activePositions[key] = pos;
+                session.addLog(`Synced active ${posType} position for ${symbol} from exchange (Size: ${exSize}).`, 'info');
+              }
+            } else {
+              if (pos) {
+                session.addLog(`Position for ${symbol} (${pos.type}) closed externally. Clearing local status.`, 'warning');
+                session.activePositions[key] = null;
+              }
             }
           }
 
@@ -1624,7 +1744,12 @@ setInterval(async () => {
           };
 
           // Check active position updates
-          if (pos) {
+          let hasActivePosition = false;
+          for (const key of keysToSync) {
+            let pos = session.activePositions[key];
+            if (!pos) continue;
+
+            hasActivePosition = true;
             evaluation.status = 'POSITION_OPEN';
             evaluation.reason = `Active ${pos.type} position is open (Size: ${pos.size.toFixed(4)}, Entry: $${pos.entryPrice.toFixed(2)})`;
             session.evaluationStates[symbol] = evaluation;
@@ -1637,8 +1762,14 @@ setInterval(async () => {
               pos.minObservedPrice = Math.min(pos.minObservedPrice || pos.entryPrice, tickerPrice);
             }
 
+            // Calculate current PnL
+            const diff = pos.type === 'LONG' ? tickerPrice - pos.entryPrice : pos.entryPrice - tickerPrice;
+            pos.pnl = diff * pos.size * pos.leverage;
+            pos.pnlPercent = (pos.pnl / (pos.entryPrice * pos.size)) * 100;
+            pos.maxLeveragedPnL = Math.max(pos.maxLeveragedPnL || 0, pos.pnlPercent);
+
             // Partial scale out check
-            if (session.riskSettings.partialTakeProfitEnabled && !pos.halfClosed) {
+            if (session.riskSettings.partialTakeProfitEnabled && !pos.halfClosed && !pos.isHedgedPair) {
               let target1Hit = false;
               if (pos.type === 'LONG' && tickerPrice >= pos.target1Price) {
                 target1Hit = true;
@@ -1648,7 +1779,7 @@ setInterval(async () => {
 
               if (target1Hit) {
                 session.addLog(`🎯 Target 1 (1.5R) hit for ${symbol} at $${pos.target1Price.toFixed(2)}. Closing 50% size.`, 'success');
-                await executeCloseOrder(session, symbol, 'TP', pos.size / 2);
+                await executeCloseOrder(session, key, 'TP', pos.size / 2);
                 
                 // Move stop loss to entry + 20% risk offset
                 const slDistance = Math.abs(pos.entryPrice - pos.stopLoss);
@@ -1661,8 +1792,8 @@ setInterval(async () => {
               }
             }
 
-            // Trailing stop checks
-            if (session.riskSettings.trailingStopEnabled && !pos.halfClosed) {
+            // Trailing stop checks (only for standard single trades)
+            if (session.riskSettings.trailingStopEnabled && !pos.halfClosed && !pos.isHedgedPair) {
               const slDistance = Math.abs(pos.entryPrice - pos.stopLoss);
 
               if (pos.type === 'LONG') {
@@ -1690,37 +1821,118 @@ setInterval(async () => {
             let hitExit = false;
             let exitReason = null;
 
-            if (pos.type === 'LONG') {
-              if (tickerPrice <= pos.stopLoss) {
-                hitExit = true;
-                exitReason = pos.halfClosed || (session.riskSettings.trailingStopEnabled && pos.stopLoss > pos.entryPrice) ? 'TRAILING_STOP' : 'SL';
-              } else if (tickerPrice >= pos.takeProfit) {
-                hitExit = true;
-                exitReason = 'TP';
+            if (pos.isHedgedPair) {
+              const pairedKey = pos.type === 'LONG' ? `${symbol}_SHORT` : `${symbol}_LONG`;
+              const paired = session.activePositions[pairedKey];
+
+              if (pos.hedgedRole === 'PRIMARY') {
+                // SCENARIO A: Primary reaches +50% PnL -> Close primary, flag hedge as Scenario A
+                if (pos.pnlPercent >= 50) {
+                  hitExit = true;
+                  exitReason = 'TP';
+                  session.addLog(`[HEDGE ENGINE] Scenario A triggered: Primary reached +50% PnL. Closing...`, 'success');
+                  if (paired) {
+                    paired.hedgedScenario = 'A';
+                  }
+                }
+                // SCENARIO C: Primary reaches +60% PnL -> Trailing Profit mode
+                else if (pos.pnlPercent >= 60 || pos.hedgedScenario === 'C') {
+                  if (pos.hedgedScenario !== 'C') {
+                    pos.hedgedScenario = 'C';
+                    session.addLog(`[HEDGE ENGINE] Scenario C triggered: Primary reached +60% PnL. Trailing Profit active.`, 'success');
+                    if (paired) {
+                      paired.hedgedScenario = 'C';
+                    }
+                  }
+
+                  const trailingFloor = 0.30 * (pos.maxLeveragedPnL || 0);
+                  if (pos.pnlPercent < trailingFloor) {
+                    hitExit = true;
+                    exitReason = 'TRAILING_STOP';
+                    session.addLog(`[HEDGE ENGINE] Trailing Stop triggered for Primary: PnL fell to ${pos.pnlPercent.toFixed(2)}% (floor: ${trailingFloor.toFixed(2)}%). Closing...`, 'warning');
+                  }
+                }
+                // SCENARIO B: If hedge closed at +70% and primary is monitoring under Scenario B
+                else if (pos.hedgedScenario === 'B') {
+                  if (pos.pnlPercent >= 40) {
+                    hitExit = true;
+                    exitReason = 'TP';
+                    session.addLog(`[HEDGE ENGINE] Scenario B recovery triggered: Primary reached +40% PnL. Closing...`, 'success');
+                  }
+                }
+              } else if (pos.hedgedRole === 'HEDGE') {
+                // SCENARIO A: If primary closed, hedge scenario is A
+                if (pos.hedgedScenario === 'A') {
+                  if (pos.pnlPercent >= 10) {
+                    hitExit = true;
+                    exitReason = 'TP';
+                    session.addLog(`[HEDGE ENGINE] Scenario A Take Profit: Hedge reached +10% PnL. Closing...`, 'success');
+                  } else if (pos.pnlPercent <= -10) {
+                    hitExit = true;
+                    exitReason = 'SL';
+                    session.addLog(`[HEDGE ENGINE] Scenario A Stop Loss: Hedge hit -10% PnL. Closing...`, 'danger');
+                  }
+                }
+                // SCENARIO B: Hedge reaches +70% PnL and primary is losing -> Close hedge, flag primary as Scenario B
+                else if (pos.pnlPercent >= 70 && paired && paired.pnlPercent < 0) {
+                  hitExit = true;
+                  exitReason = 'TP';
+                  session.addLog(`[HEDGE ENGINE] Scenario B triggered: Hedge reached +70% PnL while primary is losing. Closing hedge.`, 'success');
+                  paired.hedgedScenario = 'B';
+                }
+                // SCENARIO C: Exit hedge if <= -80% PnL or >= +10% PnL
+                else if (pos.hedgedScenario === 'C') {
+                  if (pos.pnlPercent <= -80) {
+                    hitExit = true;
+                    exitReason = 'SL';
+                    session.addLog(`[HEDGE ENGINE] Scenario C Stop Loss: Hedge hit -80% PnL. Closing...`, 'danger');
+                  } else if (pos.pnlPercent >= 10) {
+                    hitExit = true;
+                    exitReason = 'TP';
+                    session.addLog(`[HEDGE ENGINE] Scenario C Take Profit: Hedge hit +10% PnL. Closing...`, 'success');
+                  }
+                }
               }
-            } else {
-              if (tickerPrice >= pos.stopLoss) {
-                hitExit = true;
-                exitReason = pos.halfClosed || (session.riskSettings.trailingStopEnabled && pos.stopLoss < pos.entryPrice) ? 'TRAILING_STOP' : 'SL';
-              } else if (tickerPrice <= pos.takeProfit) {
-                hitExit = true;
-                exitReason = 'TP';
+            }
+
+            // Fallback to standard exits (SL / TP) if scenario did not trigger exit
+            if (!hitExit) {
+              if (pos.type === 'LONG') {
+                if (tickerPrice <= pos.stopLoss) {
+                  hitExit = true;
+                  exitReason = pos.halfClosed || (session.riskSettings.trailingStopEnabled && pos.stopLoss > pos.entryPrice) ? 'TRAILING_STOP' : 'SL';
+                } else if (tickerPrice >= pos.takeProfit) {
+                  hitExit = true;
+                  exitReason = 'TP';
+                }
+              } else {
+                if (tickerPrice >= pos.stopLoss) {
+                  hitExit = true;
+                  exitReason = pos.halfClosed || (session.riskSettings.trailingStopEnabled && pos.stopLoss < pos.entryPrice) ? 'TRAILING_STOP' : 'SL';
+                } else if (tickerPrice <= pos.takeProfit) {
+                  hitExit = true;
+                  exitReason = 'TP';
+                }
               }
             }
 
             if (hitExit) {
-              session.addLog(`Exit signal triggered for ${symbol}: Price ($${tickerPrice.toFixed(2)}) hit ${exitReason} limit (${exitReason === 'TP' ? pos.takeProfit.toFixed(2) : pos.stopLoss.toFixed(2)}). Closing...`, 'warning');
-              await executeCloseOrder(session, symbol, exitReason);
+              session.addLog(`Exit signal triggered for ${symbol} (${pos.type}): Price ($${tickerPrice.toFixed(2)}) hit ${exitReason} limit (${exitReason === 'TP' ? pos.takeProfit.toFixed(2) : pos.stopLoss.toFixed(2)}). Closing...`, 'warning');
+              await executeCloseOrder(session, key, exitReason);
             }
-
-            continue;
           }
 
+          if (hasActivePosition) continue;
+
           // Evaluate entries
-          const openCount = Object.values(session.activePositions).filter(Boolean).length;
-          if (openCount >= session.riskSettings.maxConcurrentPositions) {
+          const activeSymbolsWithPositions = Array.from(new Set(
+            Object.values(session.activePositions)
+              .filter(Boolean)
+              .map(p => p.symbol)
+          ));
+          if (activeSymbolsWithPositions.length >= session.riskSettings.maxConcurrentPositions) {
             evaluation.status = 'REJECTED';
-            evaluation.reason = `Max concurrent positions limit reached (${session.riskSettings.maxConcurrentPositions})`;
+            evaluation.reason = `Max concurrent signals limit reached (${session.riskSettings.maxConcurrentPositions} pairs)`;
             session.evaluationStates[symbol] = evaluation;
             logTickDetails(session.username, symbol, evaluation);
             continue;
@@ -1784,6 +1996,17 @@ setInterval(async () => {
           }
 
           session.addLog(`Signal detected for ${symbol}: ${decision.signal} (${decision.reason})`, 'warning');
+
+          // Volatility Protection Check
+          const volCheck = await checkVolatilityAndLiquidity(session, symbol, latestCandle);
+          if (!volCheck.ok) {
+            evaluation.status = 'REJECTED';
+            evaluation.reason = `Volatility Protection: ${volCheck.reason}`;
+            session.evaluationStates[symbol] = evaluation;
+            logTickDetails(session.username, symbol, evaluation);
+            session.addLog(`Volatility Protection: Signal skipped for ${symbol} due to: ${volCheck.reason}`, 'warning');
+            continue;
+          }
 
           const atrValue = latestCandle.atr || (latestCandle.high - latestCandle.low) || 5.0;
           const slDistance = atrValue * session.riskSettings.atrMultiplier;
@@ -1851,62 +2074,198 @@ setInterval(async () => {
             continue;
           }
 
-          const tradeSide = decision.signal === 'BUY' ? 'buy' : 'sell';
-          const payload = {
-            symbol: marketSymbol,
-            side: tradeSide,
-            size: size
-          };
-
           evaluation.calculatedSize = size;
-          evaluation.payload = payload;
           evaluation.status = 'EXECUTING';
-          evaluation.reason = `Sending ${tradeSide.toUpperCase()} entry order (Size: ${size})`;
-          session.evaluationStates[symbol] = evaluation;
-          logTickDetails(session.username, symbol, evaluation);
 
-          const entryParams = session.isHedgeMode ? { positionIdx: decision.signal === 'BUY' ? 1 : 2 } : { positionIdx: 0 };
-          try {
-            // Place entry order with retries
-            const order = await safeCreateMarketOrder(session.exchangeInstance, marketSymbol, tradeSide, size, entryParams, (txt, typ) => session.addLog(txt, typ));
-            const fillPrice = order.price || order.average || tickerPrice;
-
-            session.activePositions[symbol] = {
-              id: `live_${Date.now()}`,
-              type: decision.signal === 'BUY' ? 'LONG' : 'SHORT',
-              symbol: symbol,
-              entryPrice: fillPrice,
-              entryTime: Date.now(),
-              size: size,
-              leverage: session.riskSettings.leverage,
-              stopLoss: parseFloat(slPrice.toFixed(2)),
-              takeProfit: parseFloat(tpPrice.toFixed(2)),
-              target1Price: parseFloat(target1Price.toFixed(2)),
-              halfClosed: false,
-              pnl: 0,
-              pnlPercent: 0,
-              status: 'OPEN',
-              maxObservedPrice: fillPrice,
-              minObservedPrice: fillPrice,
-            };
-
-            evaluation.status = 'POSITION_OPEN';
-            evaluation.reason = `Executed entry for ${symbol} at $${fillPrice}`;
-            session.evaluationStates[symbol] = evaluation;
-            logTickDetails(session.username, symbol, evaluation);
-
-            session.addLog(`📥 Executed live entry for ${symbol} at $${fillPrice}. SL: $${slPrice.toFixed(2)}, Target 1 (1.5R): $${target1Price.toFixed(2)}, Target 2 (${session.riskSettings.riskRewardRatio}R): $${tpPrice.toFixed(2)}`, 'success');
-          } catch (orderErr) {
-            if (orderErr.message.includes('position idx not match position mode') || orderErr.message.includes('10001')) {
-              session.isHedgeMode = !session.isHedgeMode;
-              session.addLog(`Order failed due to position mode mismatch. Automatically switched Hedge Mode setting to: ${session.isHedgeMode}. Retrying will occur on next signal tick.`, 'warning');
+          if (session.riskSettings.hedgedDualExecutionEnabled) {
+            // Verify hedge mode first
+            const isHedgeOk = await verifyHedgeMode(session, symbol);
+            if (!isHedgeOk || !session.isHedgeMode) {
+              evaluation.status = 'REJECTED';
+              evaluation.reason = `Hedged Dual Engine: aborted entry because Hedge Mode is disabled/unavailable on exchange.`;
+              session.evaluationStates[symbol] = evaluation;
+              logTickDetails(session.username, symbol, evaluation);
+              session.addLog(`Hedged Dual Engine Error: Aborted entry on ${symbol} because Hedge Mode is disabled.`, 'danger');
+              continue;
             }
-            evaluation.status = 'ERROR';
-            evaluation.reason = `Exchange entry failed: ${orderErr.message}`;
-            evaluation.error = orderErr.message;
-            session.evaluationStates[symbol] = evaluation;
-            logTickDetails(session.username, symbol, evaluation);
-            session.addLog(`Order execution failed for ${symbol}: ${orderErr.message}`, 'danger');
+
+            const primarySide = decision.signal === 'BUY' ? 'buy' : 'sell';
+            const hedgeSide = primarySide === 'buy' ? 'sell' : 'buy';
+            const primaryIdx = decision.signal === 'BUY' ? 1 : 2;
+            const hedgeIdx = decision.signal === 'BUY' ? 2 : 1;
+
+            const primaryKey = `${symbol}_LONG`;
+            const hedgeKey = `${symbol}_SHORT`;
+
+            // Adjust leverage dynamically if exchange live
+            if (session.exchangeInstance) {
+              try {
+                await session.exchangeInstance.setLeverage(session.riskSettings.leverage, marketSymbol, {
+                  buyLeverage: session.riskSettings.leverage,
+                  sellLeverage: Math.max(1, Math.round(session.riskSettings.leverage / 2))
+                });
+              } catch (levErr) {
+                session.addLog(`Leverage Adjustment Warning: ${levErr.message}`, 'warning');
+              }
+            }
+
+            session.addLog(`Sending simultaneous Hedged Dual entries to Exchange for ${symbol} (Size: ${size})...`, 'info');
+
+            let primaryOrder = null;
+            let hedgeOrder = null;
+
+            try {
+              if (session.exchangeInstance) {
+                const results = await Promise.all([
+                  safeCreateMarketOrder(session.exchangeInstance, marketSymbol, primarySide, size, { positionIdx: primaryIdx }, (txt, typ) => session.addLog(`[Primary] ${txt}`, typ)),
+                  safeCreateMarketOrder(session.exchangeInstance, marketSymbol, hedgeSide, size, { positionIdx: hedgeIdx }, (txt, typ) => session.addLog(`[Hedge] ${txt}`, typ))
+                ]);
+                primaryOrder = results[0];
+                hedgeOrder = results[1];
+              } else {
+                primaryOrder = { price: tickerPrice, average: tickerPrice, amount: size };
+                hedgeOrder = { price: tickerPrice, average: tickerPrice, amount: size };
+              }
+
+              const primaryFill = primaryOrder.price || primaryOrder.average || tickerPrice;
+              const hedgeFill = hedgeOrder.price || hedgeOrder.average || tickerPrice;
+
+              const livePriId = `live_pri_${Date.now()}`;
+              const liveHdgId = `live_hdg_${Date.now()}`;
+
+              session.activePositions[primaryKey] = {
+                id: livePriId,
+                type: decision.signal === 'BUY' ? 'LONG' : 'SHORT',
+                symbol: symbol,
+                entryPrice: primaryFill,
+                entryTime: Date.now(),
+                size: size,
+                leverage: session.riskSettings.leverage,
+                stopLoss: parseFloat(slPrice.toFixed(2)),
+                takeProfit: parseFloat(tpPrice.toFixed(2)),
+                target1Price: parseFloat(target1Price.toFixed(2)),
+                halfClosed: false,
+                pnl: 0,
+                pnlPercent: 0,
+                status: 'OPEN',
+                maxObservedPrice: primaryFill,
+                minObservedPrice: primaryFill,
+                isHedgedPair: true,
+                hedgedRole: 'PRIMARY',
+                hedgedScenario: 'NONE',
+                pairedPositionId: liveHdgId,
+                maxLeveragedPnL: 0,
+              };
+
+              session.activePositions[hedgeKey] = {
+                id: liveHdgId,
+                type: decision.signal === 'BUY' ? 'SHORT' : 'LONG',
+                symbol: symbol,
+                entryPrice: hedgeFill,
+                entryTime: Date.now(),
+                size: size,
+                leverage: Math.max(1, Math.round(session.riskSettings.leverage / 2)),
+                stopLoss: parseFloat((hedgeFill * (decision.signal === 'BUY' ? 1.05 : 0.95)).toFixed(2)),
+                takeProfit: parseFloat((hedgeFill * (decision.signal === 'BUY' ? 0.90 : 1.10)).toFixed(2)),
+                target1Price: parseFloat((hedgeFill * (decision.signal === 'BUY' ? 0.925 : 1.075)).toFixed(2)),
+                halfClosed: false,
+                pnl: 0,
+                pnlPercent: 0,
+                status: 'OPEN',
+                maxObservedPrice: hedgeFill,
+                minObservedPrice: hedgeFill,
+                isHedgedPair: true,
+                hedgedRole: 'HEDGE',
+                hedgedScenario: 'NONE',
+                pairedPositionId: livePriId,
+                maxLeveragedPnL: 0,
+              };
+
+              evaluation.status = 'POSITION_OPEN';
+              evaluation.reason = `Executed Hedged entries for ${symbol}`;
+              session.evaluationStates[symbol] = evaluation;
+              logTickDetails(session.username, symbol, evaluation);
+
+              session.addLog(`📥 Executed paired Hedged entries for ${symbol}. Primary: ${session.activePositions[primaryKey].type} (${primaryFill}), Hedge: ${session.activePositions[hedgeKey].type} (${hedgeFill})`, 'success');
+
+            } catch (pairErr) {
+              session.addLog(`CRITICAL: Hedged entry execution encountered an error: ${pairErr.message}`, 'danger');
+              session.addLog(`Initiating safety rollback to prevent orphan positions...`, 'warning');
+
+              if (primaryOrder) {
+                try {
+                  const closeSide = primarySide === 'buy' ? 'sell' : 'buy';
+                  const closeParams = session.isHedgeMode ? { positionIdx: primaryIdx } : { positionIdx: 0 };
+                  await safeCreateMarketOrder(session.exchangeInstance, marketSymbol, closeSide, size, closeParams, (txt, typ) => session.addLog(`[Rollback Pri] ${txt}`, typ));
+                  session.addLog(`Rollback: Cleaned up primary position.`, 'success');
+                } catch (priErr) {
+                  session.addLog(`Rollback Error: Failed to clean up primary position: ${priErr.message}`, 'danger');
+                }
+              }
+
+              if (hedgeOrder) {
+                try {
+                  const closeSide = hedgeSide === 'buy' ? 'sell' : 'buy';
+                  const closeParams = session.isHedgeMode ? { positionIdx: hedgeIdx } : { positionIdx: 0 };
+                  await safeCreateMarketOrder(session.exchangeInstance, marketSymbol, closeSide, size, closeParams, (txt, typ) => session.addLog(`[Rollback Hdg] ${txt}`, typ));
+                  session.addLog(`Rollback: Cleaned up hedge position.`, 'success');
+                } catch (hdgErr) {
+                  session.addLog(`Rollback Error: Failed to clean up hedge position: ${hdgErr.message}`, 'danger');
+                }
+              }
+
+              evaluation.status = 'ERROR';
+              evaluation.reason = `Exchange entry failed: ${pairErr.message}. Rollback triggered.`;
+              evaluation.error = pairErr.message;
+              session.evaluationStates[symbol] = evaluation;
+              logTickDetails(session.username, symbol, evaluation);
+            }
+          } else {
+            // Standard single execution
+            const tradeSide = decision.signal === 'BUY' ? 'buy' : 'sell';
+            const entryParams = session.isHedgeMode ? { positionIdx: decision.signal === 'BUY' ? 1 : 2 } : { positionIdx: 0 };
+            
+            try {
+              const order = await safeCreateMarketOrder(session.exchangeInstance, marketSymbol, tradeSide, size, entryParams, (txt, typ) => session.addLog(txt, typ));
+              const fillPrice = order.price || order.average || tickerPrice;
+
+              session.activePositions[symbol] = {
+                id: `live_${Date.now()}`,
+                type: decision.signal === 'BUY' ? 'LONG' : 'SHORT',
+                symbol: symbol,
+                entryPrice: fillPrice,
+                entryTime: Date.now(),
+                size: size,
+                leverage: session.riskSettings.leverage,
+                stopLoss: parseFloat(slPrice.toFixed(2)),
+                takeProfit: parseFloat(tpPrice.toFixed(2)),
+                target1Price: parseFloat(target1Price.toFixed(2)),
+                halfClosed: false,
+                pnl: 0,
+                pnlPercent: 0,
+                status: 'OPEN',
+                maxObservedPrice: fillPrice,
+                minObservedPrice: fillPrice,
+              };
+
+              evaluation.status = 'POSITION_OPEN';
+              evaluation.reason = `Executed entry for ${symbol} at $${fillPrice}`;
+              session.evaluationStates[symbol] = evaluation;
+              logTickDetails(session.username, symbol, evaluation);
+
+              session.addLog(`📥 Executed live entry for ${symbol} at $${fillPrice}. SL: $${slPrice.toFixed(2)}, Target 1 (1.5R): $${target1Price.toFixed(2)}, Target 2 (${session.riskSettings.riskRewardRatio}R): $${tpPrice.toFixed(2)}`, 'success');
+            } catch (orderErr) {
+              if (orderErr.message.includes('position idx not match position mode') || orderErr.message.includes('10001')) {
+                session.isHedgeMode = !session.isHedgeMode;
+                session.addLog(`Order failed due to position mode mismatch. Automatically switched Hedge Mode setting to: ${session.isHedgeMode}. Retrying will occur on next signal tick.`, 'warning');
+              }
+              evaluation.status = 'ERROR';
+              evaluation.reason = `Exchange entry failed: ${orderErr.message}`;
+              evaluation.error = orderErr.message;
+              session.evaluationStates[symbol] = evaluation;
+              logTickDetails(session.username, symbol, evaluation);
+              session.addLog(`Order execution failed for ${symbol}: ${orderErr.message}`, 'danger');
+            }
           }
 
           await sleep(500); // Prevent API rate limits

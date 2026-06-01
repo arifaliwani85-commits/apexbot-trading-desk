@@ -10515,110 +10515,228 @@ function runBacktest(candles, stratSettings, riskSettings, startingBalance) {
 	let maxEquity = startingBalance;
 	let maxDrawdown = 0;
 	const trades = [];
-	let activePosition = null;
+	let activePositions = [];
 	const startIdx = Math.max(200, Math.min(data.length - 10, 200));
 	for (let i = startIdx; i < data.length; i++) {
 		const currentCandle = data[i];
 		const currentPrice = currentCandle.close;
 		let equity = balance;
-		if (activePosition) {
-			const tradePnl = (activePosition.type === "LONG" ? currentPrice - activePosition.entryPrice : activePosition.entryPrice - currentPrice) * activePosition.size * activePosition.leverage;
-			equity = balance + tradePnl;
+		for (const pos of activePositions) {
+			const tradePnl = (pos.type === "LONG" ? currentPrice - pos.entryPrice : pos.entryPrice - currentPrice) * pos.size * pos.leverage;
+			equity += tradePnl;
 		}
 		maxEquity = Math.max(maxEquity, equity);
 		const dd = (maxEquity - equity) / maxEquity * 100;
 		maxDrawdown = Math.max(maxDrawdown, dd);
-		if (activePosition) {
-			const pos = activePosition;
-			let exitPrice = 0;
-			let exitReason;
-			if (pos.type === "LONG") pos.maxObservedPrice = Math.max(pos.maxObservedPrice || pos.entryPrice, currentCandle.high);
-			else pos.minObservedPrice = Math.min(pos.minObservedPrice || pos.entryPrice, currentCandle.low);
-			if (riskSettings.trailingStopEnabled) {
-				const slDistance = Math.abs(pos.entryPrice - pos.stopLoss);
-				if (pos.type === "LONG") {
-					const profitLevel = pos.entryPrice + slDistance * riskSettings.trailingStopTrigger;
-					if ((pos.maxObservedPrice || 0) > profitLevel) {
-						const newSL = pos.entryPrice + slDistance * .2;
-						pos.stopLoss = Math.max(pos.stopLoss, newSL);
-					}
-				} else {
-					const profitLevel = pos.entryPrice - slDistance * riskSettings.trailingStopTrigger;
-					if ((pos.minObservedPrice || Infinity) < profitLevel) {
-						const newSL = pos.entryPrice - slDistance * .2;
-						pos.stopLoss = Math.min(pos.stopLoss, newSL);
-					}
-				}
-			}
-			if (pos.type === "LONG") {
-				if (currentCandle.low <= pos.stopLoss) {
-					exitPrice = pos.stopLoss;
-					exitReason = riskSettings.trailingStopEnabled && exitPrice > pos.entryPrice ? "TRAILING_STOP" : "SL";
-				} else if (currentCandle.high >= pos.takeProfit) {
-					exitPrice = pos.takeProfit;
-					exitReason = "TP";
-				}
-			} else if (currentCandle.high >= pos.stopLoss) {
-				exitPrice = pos.stopLoss;
-				exitReason = riskSettings.trailingStopEnabled && exitPrice < pos.entryPrice ? "TRAILING_STOP" : "SL";
-			} else if (currentCandle.low <= pos.takeProfit) {
-				exitPrice = pos.takeProfit;
-				exitReason = "TP";
-			}
-			if (exitReason) {
-				const pnl = pos.type === "LONG" ? (exitPrice - pos.entryPrice) * pos.size * pos.leverage : (pos.entryPrice - exitPrice) * pos.size * pos.leverage;
+		if (dd >= (riskSettings.maxPortfolioDrawdown || 10)) {
+			for (const pos of activePositions) {
+				const pnl = (pos.type === "LONG" ? currentPrice - pos.entryPrice : pos.entryPrice - currentPrice) * pos.size * pos.leverage;
 				balance += pnl;
-				const closedPos = {
+				trades.push({
 					...pos,
 					status: "CLOSED",
-					exitPrice,
+					exitPrice: currentPrice,
 					exitTime: currentCandle.time,
-					exitReason,
+					exitReason: "DRAWDOWN",
 					pnl,
 					pnlPercent: pnl / (pos.entryPrice * pos.size) * 100
-				};
-				trades.push(closedPos);
-				activePosition = null;
+				});
 			}
+			activePositions = [];
+			maxDrawdown = Math.max(maxDrawdown, dd);
+			break;
 		}
-		if (!activePosition) {
+		if (activePositions.length > 0) {
+			const toCloseIds = [];
+			const updatedPositions = [];
+			for (const pos of activePositions) {
+				if (pos.type === "LONG") pos.maxObservedPrice = Math.max(pos.maxObservedPrice || pos.entryPrice, currentCandle.high);
+				else pos.minObservedPrice = Math.min(pos.minObservedPrice || pos.entryPrice, currentCandle.low);
+				pos.pnl = (pos.type === "LONG" ? currentPrice - pos.entryPrice : pos.entryPrice - currentPrice) * pos.size * pos.leverage;
+				pos.pnlPercent = pos.pnl / (pos.entryPrice * pos.size) * 100;
+				pos.maxLeveragedPnL = Math.max(pos.maxLeveragedPnL || 0, pos.pnlPercent);
+			}
+			for (const pos of activePositions) {
+				if (toCloseIds.includes(pos.id)) continue;
+				let exitPrice = 0;
+				let exitReason;
+				if (pos.isHedgedPair) {
+					const paired = activePositions.find((p) => p.id === pos.pairedPositionId && !toCloseIds.includes(p.id));
+					const role = pos.hedgedRole;
+					if (role === "PRIMARY") {
+						if (pos.pnlPercent >= 50) {
+							exitPrice = currentPrice;
+							exitReason = "TP";
+							toCloseIds.push(pos.id);
+							if (paired) paired.hedgedScenario = "A";
+						} else if (pos.pnlPercent >= 60 || pos.hedgedScenario === "C") {
+							pos.hedgedScenario = "C";
+							if (paired) paired.hedgedScenario = "C";
+							if (pos.pnlPercent < .3 * (pos.maxLeveragedPnL || 0)) {
+								exitPrice = currentPrice;
+								exitReason = "TRAILING_STOP";
+								toCloseIds.push(pos.id);
+							}
+						} else if (pos.hedgedScenario === "B") {
+							if (pos.pnlPercent >= 40) {
+								exitPrice = currentPrice;
+								exitReason = "TP";
+								toCloseIds.push(pos.id);
+							}
+						}
+					} else if (role === "HEDGE") {
+						if (pos.hedgedScenario === "A") {
+							if (pos.pnlPercent >= 10) {
+								exitPrice = currentPrice;
+								exitReason = "TP";
+								toCloseIds.push(pos.id);
+							} else if (pos.pnlPercent <= -10) {
+								exitPrice = currentPrice;
+								exitReason = "SL";
+								toCloseIds.push(pos.id);
+							}
+						} else if (pos.pnlPercent >= 70 && paired && paired.pnlPercent < 0) {
+							exitPrice = currentPrice;
+							exitReason = "TP";
+							toCloseIds.push(pos.id);
+							paired.hedgedScenario = "B";
+						} else if (pos.hedgedScenario === "C") {
+							if (pos.pnlPercent <= -80) {
+								exitPrice = currentPrice;
+								exitReason = "SL";
+								toCloseIds.push(pos.id);
+							} else if (pos.pnlPercent >= 10) {
+								exitPrice = currentPrice;
+								exitReason = "TP";
+								toCloseIds.push(pos.id);
+							}
+						}
+					}
+				}
+				if (!exitReason) {
+					if (pos.type === "LONG") {
+						if (currentCandle.low <= pos.stopLoss) {
+							exitPrice = pos.stopLoss;
+							exitReason = riskSettings.trailingStopEnabled && exitPrice > pos.entryPrice ? "TRAILING_STOP" : "SL";
+							toCloseIds.push(pos.id);
+						} else if (currentCandle.high >= pos.takeProfit) {
+							exitPrice = pos.takeProfit;
+							exitReason = "TP";
+							toCloseIds.push(pos.id);
+						}
+					} else if (currentCandle.high >= pos.stopLoss) {
+						exitPrice = pos.stopLoss;
+						exitReason = riskSettings.trailingStopEnabled && exitPrice < pos.entryPrice ? "TRAILING_STOP" : "SL";
+						toCloseIds.push(pos.id);
+					} else if (currentCandle.low <= pos.takeProfit) {
+						exitPrice = pos.takeProfit;
+						exitReason = "TP";
+						toCloseIds.push(pos.id);
+					}
+				}
+				if (exitReason) {
+					const pnl = pos.type === "LONG" ? (exitPrice - pos.entryPrice) * pos.size * pos.leverage : (pos.entryPrice - exitPrice) * pos.size * pos.leverage;
+					balance += pnl;
+					trades.push({
+						...pos,
+						status: "CLOSED",
+						exitPrice,
+						exitTime: currentCandle.time,
+						exitReason,
+						pnl,
+						pnlPercent: pnl / (pos.entryPrice * pos.size) * 100
+					});
+				} else updatedPositions.push(pos);
+			}
+			activePositions = updatedPositions;
+		}
+		if (Array.from(new Set(activePositions.map((p) => p.symbol))).length < (riskSettings.maxConcurrentPositions || 3)) {
 			const decision = evaluateStrategy(data.slice(0, i + 1), stratSettings);
 			if (decision.signal) {
-				const slDistance = (currentCandle.atr || currentCandle.high - currentCandle.low) * riskSettings.atrMultiplier;
-				let slPrice = 0;
-				let tpPrice = 0;
-				if (decision.signal === "BUY") {
-					slPrice = currentPrice - slDistance;
-					tpPrice = currentPrice + slDistance * riskSettings.riskRewardRatio;
-				} else {
-					slPrice = currentPrice + slDistance;
-					tpPrice = currentPrice - slDistance * riskSettings.riskRewardRatio;
+				const atrValue = currentCandle.atr || currentCandle.high - currentCandle.low || 1;
+				if (atrValue / currentPrice * 100 >= (riskSettings.volatilityAtrMin !== void 0 ? riskSettings.volatilityAtrMin : .05)) {
+					const slDistance = atrValue * riskSettings.atrMultiplier;
+					let primaryType = decision.signal === "BUY" ? "LONG" : "SHORT";
+					let hedgeType = primaryType === "LONG" ? "SHORT" : "LONG";
+					let positionSize = balance * (riskSettings.riskPercent / 100) / slDistance;
+					const totalCapitalRequired = positionSize * currentPrice;
+					const maxAllowedExposure = balance * riskSettings.leverage;
+					if (totalCapitalRequired > maxAllowedExposure) positionSize = maxAllowedExposure / currentPrice;
+					const primaryId = `backtest_primary_${i}`;
+					const hedgeId = `backtest_hedge_${i}`;
+					if (riskSettings.hedgedDualExecutionEnabled) {
+						let primarySl = primaryType === "LONG" ? currentPrice - slDistance : currentPrice + slDistance;
+						let primaryTp = primaryType === "LONG" ? currentPrice + slDistance * riskSettings.riskRewardRatio : currentPrice - slDistance * riskSettings.riskRewardRatio;
+						const primaryPos = {
+							id: primaryId,
+							type: primaryType,
+							symbol: "MOCKUSDT",
+							entryPrice: currentPrice,
+							entryTime: currentCandle.time,
+							size: positionSize,
+							leverage: riskSettings.leverage,
+							stopLoss: parseFloat(primarySl.toFixed(2)),
+							takeProfit: parseFloat(primaryTp.toFixed(2)),
+							pnl: 0,
+							pnlPercent: 0,
+							status: "OPEN",
+							maxObservedPrice: currentPrice,
+							minObservedPrice: currentPrice,
+							isHedgedPair: true,
+							hedgedRole: "PRIMARY",
+							hedgedScenario: "NONE",
+							pairedPositionId: hedgeId,
+							maxLeveragedPnL: 0
+						};
+						let hedgeSl = hedgeType === "LONG" ? currentPrice - slDistance : currentPrice + slDistance;
+						let hedgeTp = hedgeType === "LONG" ? currentPrice + slDistance * riskSettings.riskRewardRatio : currentPrice - slDistance * riskSettings.riskRewardRatio;
+						const hedgePos = {
+							id: hedgeId,
+							type: hedgeType,
+							symbol: "MOCKUSDT",
+							entryPrice: currentPrice,
+							entryTime: currentCandle.time,
+							size: positionSize,
+							leverage: Math.max(1, Math.round(riskSettings.leverage / 2)),
+							stopLoss: parseFloat(hedgeSl.toFixed(2)),
+							takeProfit: parseFloat(hedgeTp.toFixed(2)),
+							pnl: 0,
+							pnlPercent: 0,
+							status: "OPEN",
+							maxObservedPrice: currentPrice,
+							minObservedPrice: currentPrice,
+							isHedgedPair: true,
+							hedgedRole: "HEDGE",
+							hedgedScenario: "NONE",
+							pairedPositionId: primaryId,
+							maxLeveragedPnL: 0
+						};
+						activePositions.push(primaryPos, hedgePos);
+					} else {
+						let slPrice = primaryType === "LONG" ? currentPrice - slDistance : currentPrice + slDistance;
+						let tpPrice = primaryType === "LONG" ? currentPrice + slDistance * riskSettings.riskRewardRatio : currentPrice - slDistance * riskSettings.riskRewardRatio;
+						activePositions.push({
+							id: `backtest_single_${i}`,
+							type: primaryType,
+							symbol: "MOCKUSDT",
+							entryPrice: currentPrice,
+							entryTime: currentCandle.time,
+							size: positionSize,
+							leverage: riskSettings.leverage,
+							stopLoss: parseFloat(slPrice.toFixed(2)),
+							takeProfit: parseFloat(tpPrice.toFixed(2)),
+							pnl: 0,
+							pnlPercent: 0,
+							status: "OPEN",
+							maxObservedPrice: currentPrice,
+							minObservedPrice: currentPrice
+						});
+					}
 				}
-				let positionSize = balance * (riskSettings.riskPercent / 100) / slDistance;
-				const totalCapitalRequired = positionSize * currentPrice;
-				const maxAllowedLeveragedExposure = balance * riskSettings.leverage;
-				if (totalCapitalRequired > maxAllowedLeveragedExposure) positionSize = maxAllowedLeveragedExposure / currentPrice;
-				activePosition = {
-					id: `backtest_${i}`,
-					type: decision.signal === "BUY" ? "LONG" : "SHORT",
-					symbol: "MOCKUSDT",
-					entryPrice: currentPrice,
-					entryTime: currentCandle.time,
-					size: positionSize,
-					leverage: riskSettings.leverage,
-					stopLoss: parseFloat(slPrice.toFixed(2)),
-					takeProfit: parseFloat(tpPrice.toFixed(2)),
-					pnl: 0,
-					pnlPercent: 0,
-					status: "OPEN",
-					maxObservedPrice: currentPrice,
-					minObservedPrice: currentPrice
-				};
 			}
 		}
 	}
-	if (activePosition) {
-		const pos = activePosition;
+	for (const pos of activePositions) {
 		const finalPrice = data[data.length - 1].close;
 		const pnl = pos.type === "LONG" ? (finalPrice - pos.entryPrice) * pos.size * pos.leverage : (pos.entryPrice - finalPrice) * pos.size * pos.leverage;
 		balance += pnl;
@@ -12334,6 +12452,137 @@ var StrategyConfig = ({ stratSettings, setStratSettings, riskSettings, setRiskSe
 					}),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 						className: "switch-group",
+						style: { marginTop: "12px" },
+						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+							className: "switch-label",
+							style: { cursor: "pointer" },
+							onClick: () => handleRiskParamChange("hedgedDualExecutionEnabled", !riskSettings.hedgedDualExecutionEnabled),
+							children: "Hedged Dual Position Engine"
+						}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("label", {
+							className: "switch",
+							children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+								type: "checkbox",
+								checked: riskSettings.hedgedDualExecutionEnabled,
+								onChange: (e) => handleRiskParamChange("hedgedDualExecutionEnabled", e.target.checked)
+							}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { className: "slider" })]
+						})]
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+						style: {
+							fontSize: "10px",
+							color: "var(--text-secondary)",
+							paddingLeft: "12px",
+							marginBottom: "12px"
+						},
+						children: "Opens a primary position (leverage X) and a hedge position (leverage X/2, opposite direction) simultaneously."
+					}),
+					riskSettings.hedgedDualExecutionEnabled && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "form-group",
+						style: {
+							paddingLeft: "12px",
+							borderLeft: "2px solid var(--border-color)",
+							marginTop: "8px",
+							marginBottom: "12px",
+							display: "flex",
+							flexDirection: "column",
+							gap: "10px"
+						},
+						children: [
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+								className: "form-group",
+								style: { marginBottom: "4px" },
+								children: [
+									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("label", {
+										className: "form-label",
+										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Max Portfolio Drawdown:" }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+											className: "val",
+											children: [riskSettings.maxPortfolioDrawdown || 10, "%"]
+										})]
+									}),
+									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+										type: "range",
+										min: "2.0",
+										max: "15.0",
+										step: "0.5",
+										className: "range-input",
+										value: riskSettings.maxPortfolioDrawdown || 10,
+										onChange: (e) => handleRiskParamChange("maxPortfolioDrawdown", parseFloat(e.target.value))
+									}),
+									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+										style: {
+											fontSize: "9px",
+											color: "var(--text-secondary)"
+										},
+										children: [
+											"Circuit breaker deactivates trading if portfolio equity drops ",
+											riskSettings.maxPortfolioDrawdown || 10,
+											"% from peak."
+										]
+									})
+								]
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+								className: "form-group",
+								style: { marginBottom: "4px" },
+								children: [
+									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("label", {
+										className: "form-label",
+										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Min Volatility ATR %:" }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+											className: "val",
+											children: [riskSettings.volatilityAtrMin !== void 0 ? riskSettings.volatilityAtrMin : .05, "%"]
+										})]
+									}),
+									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+										type: "range",
+										min: "0.01",
+										max: "0.50",
+										step: "0.01",
+										className: "range-input",
+										value: riskSettings.volatilityAtrMin !== void 0 ? riskSettings.volatilityAtrMin : .05,
+										onChange: (e) => handleRiskParamChange("volatilityAtrMin", parseFloat(e.target.value))
+									}),
+									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+										style: {
+											fontSize: "9px",
+											color: "var(--text-secondary)"
+										},
+										children: "Skips execution if the current ATR percent falls below this limit."
+									})
+								]
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+								className: "form-group",
+								style: { marginBottom: "4px" },
+								children: [
+									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("label", {
+										className: "form-label",
+										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Max Bid-Ask Spread %:" }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+											className: "val",
+											children: [riskSettings.volatilitySpreadMax !== void 0 ? riskSettings.volatilitySpreadMax : .1, "%"]
+										})]
+									}),
+									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+										type: "range",
+										min: "0.01",
+										max: "0.50",
+										step: "0.01",
+										className: "range-input",
+										value: riskSettings.volatilitySpreadMax !== void 0 ? riskSettings.volatilitySpreadMax : .1,
+										onChange: (e) => handleRiskParamChange("volatilitySpreadMax", parseFloat(e.target.value))
+									}),
+									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+										style: {
+											fontSize: "9px",
+											color: "var(--text-secondary)"
+										},
+										children: "Skips trade if bid-ask spread is wider than this threshold."
+									})
+								]
+							})
+						]
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "switch-group",
 						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
 							className: "switch-label",
 							style: { cursor: "pointer" },
@@ -12877,7 +13126,7 @@ var OrderBook = ({ latestPrice }) => {
 };
 //#endregion
 //#region src/components/TradeLogs.tsx
-var TradeLogs = ({ activePosition, closedTrades, logs, onClosePosition, latestPrice, allPositions = [], evaluationStates = {} }) => {
+var TradeLogs = ({ activePosition, closedTrades, logs, onClosePosition, latestPrice, allPositions = [], evaluationStates = {}, accountBalance = 1e4 }) => {
 	const [activeTab, setActiveTab] = (0, import_react.useState)("positions");
 	const logEndRef = (0, import_react.useRef)(null);
 	(0, import_react.useEffect)(() => {
@@ -12981,105 +13230,530 @@ var TradeLogs = ({ activePosition, closedTrades, logs, onClosePosition, latestPr
 						flexDirection: "column",
 						overflowY: "auto"
 					},
-					children: allPositions.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-						style: {
-							display: "flex",
-							flexDirection: "column",
-							gap: "10px"
-						},
-						children: allPositions.map((pos) => {
-							const currentPriceForPnl = pos.symbol === activePosition?.symbol ? latestPrice : pos.entryPrice;
-							const pnlUsd = (pos.type === "LONG" ? currentPriceForPnl - pos.entryPrice : pos.entryPrice - currentPriceForPnl) * pos.size * pos.leverage;
-							const pnlPct = pnlUsd / (pos.entryPrice * pos.size) * 100;
-							return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-								style: {
-									background: "var(--bg-tertiary)",
-									border: "1px solid var(--border-color)",
-									borderRadius: "var(--radius-md)",
-									padding: "12px",
-									display: "flex",
-									justifyContent: "space-between",
-									alignItems: "center"
-								},
-								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+					children: allPositions.length > 0 ? (() => {
+						const groups = [];
+						const processedIds = /* @__PURE__ */ new Set();
+						allPositions.forEach((pos) => {
+							if (processedIds.has(pos.id)) return;
+							if (pos.isHedgedPair) {
+								if (pos.hedgedRole === "PRIMARY") {
+									const pairedHedge = allPositions.find((p) => p.id === pos.pairedPositionId);
+									groups.push({
+										symbol: pos.symbol,
+										primary: pos,
+										hedge: pairedHedge
+									});
+									processedIds.add(pos.id);
+									if (pairedHedge) processedIds.add(pairedHedge.id);
+								} else if (!allPositions.find((p) => p.id === pos.pairedPositionId)) {
+									groups.push({
+										symbol: pos.symbol,
+										hedge: pos
+									});
+									processedIds.add(pos.id);
+								}
+							} else {
+								groups.push({
+									symbol: pos.symbol,
+									single: pos
+								});
+								processedIds.add(pos.id);
+							}
+						});
+						return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+							style: {
+								display: "flex",
+								flexDirection: "column",
+								gap: "14px"
+							},
+							children: groups.map((group, idx) => {
+								let primaryPnlVal = 0;
+								let primaryPct = 0;
+								let hedgePnlVal = 0;
+								let hedgePct = 0;
+								let singlePnlVal = 0;
+								let singlePct = 0;
+								let groupUnrealizedPnl = 0;
+								let groupRealizedPnl = 0;
+								if (group.single) {
+									const curPrice = group.single.symbol === activePosition?.symbol ? latestPrice : group.single.entryPrice;
+									singlePnlVal = (group.single.type === "LONG" ? curPrice - group.single.entryPrice : group.single.entryPrice - curPrice) * group.single.size * group.single.leverage;
+									singlePct = singlePnlVal / (group.single.entryPrice * group.single.size) * 100;
+									groupUnrealizedPnl += singlePnlVal;
+								}
+								if (group.primary) {
+									const curPrice = group.primary.symbol === activePosition?.symbol ? latestPrice : group.primary.entryPrice;
+									primaryPnlVal = (group.primary.type === "LONG" ? curPrice - group.primary.entryPrice : group.primary.entryPrice - curPrice) * group.primary.size * group.primary.leverage;
+									primaryPct = primaryPnlVal / (group.primary.entryPrice * group.primary.size) * 100;
+									groupUnrealizedPnl += primaryPnlVal;
+								} else if (group.hedge) {
+									const cp = closedTrades.find((t) => t.id === group.hedge?.pairedPositionId);
+									if (cp) {
+										primaryPnlVal = cp.pnl;
+										primaryPct = cp.pnlPercent;
+										groupRealizedPnl += cp.pnl;
+									}
+								}
+								if (group.hedge) {
+									const curPrice = group.hedge.symbol === activePosition?.symbol ? latestPrice : group.hedge.entryPrice;
+									hedgePnlVal = (group.hedge.type === "LONG" ? curPrice - group.hedge.entryPrice : group.hedge.entryPrice - curPrice) * group.hedge.size * group.hedge.leverage;
+									hedgePct = hedgePnlVal / (group.hedge.entryPrice * group.hedge.size) * 100;
+									groupUnrealizedPnl += hedgePnlVal;
+								} else if (group.primary) {
+									const ch = closedTrades.find((t) => t.id === group.primary?.pairedPositionId);
+									if (ch) {
+										hedgePnlVal = ch.pnl;
+										hedgePct = ch.pnlPercent;
+										groupRealizedPnl += ch.pnl;
+									}
+								}
+								const combinedPnl = groupRealizedPnl + groupUnrealizedPnl;
+								let hedgeEfficiency = null;
+								if (primaryPnlVal < 0) hedgeEfficiency = hedgePnlVal / Math.abs(primaryPnlVal) * 100;
+								let riskExposure = 0;
+								if (group.single) riskExposure = group.single.size * group.single.entryPrice / accountBalance * 100;
+								if (group.primary) riskExposure += group.primary.size * group.primary.entryPrice / accountBalance * 100;
+								if (group.hedge) riskExposure += group.hedge.size * group.hedge.entryPrice / accountBalance * 100;
+								const activeScenario = group.primary?.hedgedScenario || group.hedge?.hedgedScenario || "NONE";
+								const isHedged = !!(group.primary || group.hedge);
+								return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 									style: {
+										background: "var(--bg-tertiary)",
+										border: "1px solid var(--border-color)",
+										borderRadius: "var(--radius-lg)",
+										padding: "16px",
 										display: "flex",
-										alignItems: "center",
-										gap: "6px"
-									},
-									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-										style: {
-											fontWeight: "bold",
-											fontFamily: "var(--font-mono)"
-										},
-										children: pos.symbol
-									}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
-										className: `badge ${pos.type === "LONG" ? "badge-long" : "badge-short"}`,
-										style: {
-											fontSize: "9px",
-											padding: "1px 4px"
-										},
-										children: [
-											pos.type,
-											" ",
-											pos.leverage,
-											"X"
-										]
-									})]
-								}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-									style: {
-										fontSize: "10px",
-										color: "var(--text-secondary)",
-										fontFamily: "var(--font-mono)",
-										marginTop: "4px"
-									},
-									children: [
-										"Entry: $",
-										pos.entryPrice.toLocaleString(void 0, { minimumFractionDigits: 2 }),
-										" | SL: $",
-										pos.stopLoss.toLocaleString(void 0, { minimumFractionDigits: 2 }),
-										" | TP: $",
-										pos.takeProfit.toLocaleString(void 0, { minimumFractionDigits: 2 })
-									]
-								})] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-									style: {
-										display: "flex",
-										alignItems: "center",
+										flexDirection: "column",
 										gap: "12px"
 									},
-									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
-										className: pnlUsd >= 0 ? "green-text" : "red-text",
-										style: {
-											fontFamily: "var(--font-mono)",
-											fontWeight: "bold",
-											fontSize: "13px"
-										},
-										children: [
-											pnlUsd >= 0 ? "+" : "",
-											"$",
-											pnlUsd.toFixed(2),
-											" (",
-											pnlUsd >= 0 ? "+" : "",
-											pnlPct.toFixed(1),
-											"%)"
-										]
-									}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
-										onClick: () => onClosePosition(pos.symbol),
-										className: "btn btn-secondary",
-										style: {
-											width: "auto",
-											padding: "2px 6px",
-											fontSize: "10px",
-											display: "flex",
-											gap: "2px",
-											alignItems: "center"
-										},
-										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(X, { size: 10 }), " Close"]
-									})]
-								})]
-							}, pos.id);
-						})
-					}) : activePosition ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+									children: [
+										/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+											style: {
+												display: "flex",
+												justifyContent: "space-between",
+												alignItems: "center"
+											},
+											children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+												style: {
+													display: "flex",
+													alignItems: "center",
+													gap: "8px"
+												},
+												children: [
+													/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+														style: {
+															fontSize: "15px",
+															fontWeight: "bold",
+															fontFamily: "var(--font-mono)"
+														},
+														children: group.symbol
+													}),
+													isHedged && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+														className: "badge",
+														style: {
+															background: "rgba(37, 99, 235, 0.1)",
+															color: "var(--accent-blue)",
+															fontSize: "9px"
+														},
+														children: "HEDGED PAIR"
+													}),
+													isHedged && activeScenario !== "NONE" && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+														className: "badge",
+														style: {
+															background: "rgba(245, 158, 11, 0.15)",
+															color: "var(--accent-gold)",
+															fontSize: "9px"
+														},
+														children: ["SCENARIO ", activeScenario]
+													})
+												]
+											}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+												onClick: () => onClosePosition(group.symbol),
+												className: "btn btn-secondary",
+												style: {
+													width: "auto",
+													padding: "4px 10px",
+													fontSize: "11px",
+													display: "flex",
+													gap: "4px",
+													alignItems: "center"
+												},
+												children: [
+													/* @__PURE__ */ (0, import_jsx_runtime.jsx)(X, { size: 12 }),
+													" ",
+													isHedged ? "Close Pair" : "Close Trade"
+												]
+											})]
+										}),
+										/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+											style: {
+												display: "flex",
+												flexDirection: "column",
+												gap: "8px"
+											},
+											children: [
+												group.single && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+													style: {
+														display: "flex",
+														justifyContent: "space-between",
+														alignItems: "center",
+														padding: "8px 10px",
+														background: "var(--bg-secondary)",
+														borderRadius: "var(--radius-md)"
+													},
+													children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+														className: `badge ${group.single.type === "LONG" ? "badge-long" : "badge-short"}`,
+														style: {
+															fontSize: "9px",
+															marginRight: "6px"
+														},
+														children: [
+															group.single.type,
+															" ",
+															group.single.leverage,
+															"X"
+														]
+													}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+														style: {
+															fontSize: "11px",
+															color: "var(--text-secondary)",
+															fontFamily: "var(--font-mono)"
+														},
+														children: [
+															"Entry: $",
+															group.single.entryPrice.toLocaleString(void 0, { minimumFractionDigits: 2 }),
+															" | SL: $",
+															group.single.stopLoss.toLocaleString(),
+															" | TP: $",
+															group.single.takeProfit.toLocaleString()
+														]
+													})] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+														className: singlePnlVal >= 0 ? "green-text" : "red-text",
+														style: {
+															fontFamily: "var(--font-mono)",
+															fontWeight: "bold",
+															fontSize: "12px"
+														},
+														children: [
+															singlePnlVal >= 0 ? "+" : "",
+															"$",
+															singlePnlVal.toFixed(2),
+															" (",
+															singlePnlVal >= 0 ? "+" : "",
+															singlePct.toFixed(1),
+															"%)"
+														]
+													})]
+												}),
+												group.primary && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+													style: {
+														display: "flex",
+														justifyContent: "space-between",
+														alignItems: "center",
+														padding: "8px 10px",
+														background: "var(--bg-secondary)",
+														borderRadius: "var(--radius-md)",
+														borderLeft: "3px solid var(--accent-blue)"
+													},
+													children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
+														/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+															className: "badge",
+															style: {
+																background: "rgba(37, 99, 235, 0.15)",
+																color: "var(--accent-blue)",
+																fontSize: "8px",
+																padding: "1px 3px",
+																marginRight: "6px"
+															},
+															children: "PRIMARY"
+														}),
+														/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+															className: `badge ${group.primary.type === "LONG" ? "badge-long" : "badge-short"}`,
+															style: {
+																fontSize: "9px",
+																marginRight: "6px"
+															},
+															children: [
+																group.primary.type,
+																" ",
+																group.primary.leverage,
+																"X"
+															]
+														}),
+														/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+															style: {
+																fontSize: "11px",
+																color: "var(--text-secondary)",
+																fontFamily: "var(--font-mono)"
+															},
+															children: [
+																"Entry: $",
+																group.primary.entryPrice.toLocaleString(void 0, { minimumFractionDigits: 2 }),
+																" | SL: $",
+																group.primary.stopLoss.toLocaleString(),
+																" | TP: $",
+																group.primary.takeProfit.toLocaleString()
+															]
+														})
+													] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+														className: primaryPnlVal >= 0 ? "green-text" : "red-text",
+														style: {
+															fontFamily: "var(--font-mono)",
+															fontWeight: "bold",
+															fontSize: "12px"
+														},
+														children: [
+															primaryPnlVal >= 0 ? "+" : "",
+															"$",
+															primaryPnlVal.toFixed(2),
+															" (",
+															primaryPnlVal >= 0 ? "+" : "",
+															primaryPct.toFixed(1),
+															"%)"
+														]
+													})]
+												}),
+												!group.primary && isHedged && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+													style: {
+														display: "flex",
+														justifyContent: "space-between",
+														alignItems: "center",
+														padding: "8px 10px",
+														background: "var(--bg-secondary)",
+														borderRadius: "var(--radius-md)",
+														borderLeft: "3px solid var(--border-color)",
+														opacity: .6
+													},
+													children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+														className: "badge",
+														style: {
+															background: "var(--border-color)",
+															color: "var(--text-secondary)",
+															fontSize: "8px",
+															padding: "1px 3px",
+															marginRight: "6px"
+														},
+														children: "PRIMARY"
+													}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+														className: "badge",
+														style: {
+															background: "var(--border-color)",
+															color: "var(--text-secondary)",
+															fontSize: "9px",
+															marginRight: "6px"
+														},
+														children: "CLOSED"
+													})] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+														className: primaryPnlVal >= 0 ? "green-text" : "red-text",
+														style: {
+															fontFamily: "var(--font-mono)",
+															fontWeight: "bold",
+															fontSize: "12px"
+														},
+														children: [
+															"Realized: ",
+															primaryPnlVal >= 0 ? "+" : "",
+															"$",
+															primaryPnlVal.toFixed(2)
+														]
+													})]
+												}),
+												group.hedge && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+													style: {
+														display: "flex",
+														justifyContent: "space-between",
+														alignItems: "center",
+														padding: "8px 10px",
+														background: "var(--bg-secondary)",
+														borderRadius: "var(--radius-md)",
+														borderLeft: "3px solid var(--accent-gold)"
+													},
+													children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
+														/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+															className: "badge",
+															style: {
+																background: "rgba(245, 158, 11, 0.15)",
+																color: "var(--accent-gold)",
+																fontSize: "8px",
+																padding: "1px 3px",
+																marginRight: "6px"
+															},
+															children: "HEDGE"
+														}),
+														/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+															className: `badge ${group.hedge.type === "LONG" ? "badge-long" : "badge-short"}`,
+															style: {
+																fontSize: "9px",
+																marginRight: "6px"
+															},
+															children: [
+																group.hedge.type,
+																" ",
+																group.hedge.leverage,
+																"X"
+															]
+														}),
+														/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+															style: {
+																fontSize: "11px",
+																color: "var(--text-secondary)",
+																fontFamily: "var(--font-mono)"
+															},
+															children: [
+																"Entry: $",
+																group.hedge.entryPrice.toLocaleString(void 0, { minimumFractionDigits: 2 }),
+																" | SL: $",
+																group.hedge.stopLoss.toLocaleString(),
+																" | TP: $",
+																group.hedge.takeProfit.toLocaleString()
+															]
+														})
+													] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+														className: hedgePnlVal >= 0 ? "green-text" : "red-text",
+														style: {
+															fontFamily: "var(--font-mono)",
+															fontWeight: "bold",
+															fontSize: "12px"
+														},
+														children: [
+															hedgePnlVal >= 0 ? "+" : "",
+															"$",
+															hedgePnlVal.toFixed(2),
+															" (",
+															hedgePnlVal >= 0 ? "+" : "",
+															hedgePct.toFixed(1),
+															"%)"
+														]
+													})]
+												}),
+												!group.hedge && isHedged && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+													style: {
+														display: "flex",
+														justifyContent: "space-between",
+														alignItems: "center",
+														padding: "8px 10px",
+														background: "var(--bg-secondary)",
+														borderRadius: "var(--radius-md)",
+														borderLeft: "3px solid var(--border-color)",
+														opacity: .6
+													},
+													children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+														className: "badge",
+														style: {
+															background: "var(--border-color)",
+															color: "var(--text-secondary)",
+															fontSize: "8px",
+															padding: "1px 3px",
+															marginRight: "6px"
+														},
+														children: "HEDGE"
+													}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+														className: "badge",
+														style: {
+															background: "var(--border-color)",
+															color: "var(--text-secondary)",
+															fontSize: "9px",
+															marginRight: "6px"
+														},
+														children: "CLOSED"
+													})] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+														className: hedgePnlVal >= 0 ? "green-text" : "red-text",
+														style: {
+															fontFamily: "var(--font-mono)",
+															fontWeight: "bold",
+															fontSize: "12px"
+														},
+														children: [
+															"Realized: ",
+															hedgePnlVal >= 0 ? "+" : "",
+															"$",
+															hedgePnlVal.toFixed(2)
+														]
+													})]
+												})
+											]
+										}),
+										/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+											style: {
+												borderTop: "1px solid var(--border-color)",
+												paddingTop: "10px",
+												display: "grid",
+												gridTemplateColumns: isHedged ? "repeat(4, 1fr)" : "repeat(2, 1fr)",
+												gap: "8px",
+												textAlign: "center",
+												fontSize: "11px"
+											},
+											children: [
+												/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+													style: {
+														color: "var(--text-secondary)",
+														fontSize: "9px",
+														textTransform: "uppercase"
+													},
+													children: "Combined PnL"
+												}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+													className: combinedPnl >= 0 ? "green-text" : "red-text",
+													style: {
+														fontFamily: "var(--font-mono)",
+														fontWeight: "bold"
+													},
+													children: [
+														combinedPnl >= 0 ? "+" : "",
+														"$",
+														combinedPnl.toFixed(2)
+													]
+												})] }),
+												isHedged && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(import_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+													style: {
+														color: "var(--text-secondary)",
+														fontSize: "9px",
+														textTransform: "uppercase"
+													},
+													children: "Realized PnL"
+												}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+													style: {
+														fontFamily: "var(--font-mono)",
+														fontWeight: "bold",
+														color: groupRealizedPnl >= 0 ? "var(--accent-green)" : "var(--accent-red)"
+													},
+													children: ["$", groupRealizedPnl.toFixed(2)]
+												})] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+													style: {
+														color: "var(--text-secondary)",
+														fontSize: "9px",
+														textTransform: "uppercase"
+													},
+													children: "Hedge Efficiency"
+												}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+													style: {
+														fontFamily: "var(--font-mono)",
+														fontWeight: "bold",
+														color: "var(--text-primary)"
+													},
+													children: hedgeEfficiency !== null ? `${hedgeEfficiency.toFixed(1)}%` : "N/A"
+												})] })] }),
+												/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+													style: {
+														color: "var(--text-secondary)",
+														fontSize: "9px",
+														textTransform: "uppercase"
+													},
+													children: "Risk Exposure"
+												}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+													style: {
+														fontFamily: "var(--font-mono)",
+														fontWeight: "bold",
+														color: riskExposure > 100 ? "var(--accent-red)" : "var(--text-primary)"
+													},
+													children: [riskExposure.toFixed(1), "%"]
+												})] })
+											]
+										})
+									]
+								}, idx);
+							})
+						});
+					})() : activePosition ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 						style: {
 							background: "var(--bg-tertiary)",
 							border: "1px solid var(--border-color)",
@@ -14364,7 +15038,11 @@ function App() {
 		maxDailyDrawdown: 5,
 		leverage: 1,
 		maxConcurrentPositions: 3,
-		partialTakeProfitEnabled: true
+		partialTakeProfitEnabled: true,
+		hedgedDualExecutionEnabled: true,
+		maxPortfolioDrawdown: 10,
+		volatilityAtrMin: .05,
+		volatilitySpreadMax: .1
 	});
 	const [showIndicators, setShowIndicators] = (0, import_react.useState)({
 		ema20: true,
@@ -14374,6 +15052,7 @@ function App() {
 	});
 	const [candles, setCandles] = (0, import_react.useState)([]);
 	const [activePosition, setActivePosition] = (0, import_react.useState)(null);
+	const [simulatorPositions, setSimulatorPositions] = (0, import_react.useState)([]);
 	const [allPositions, setAllPositions] = (0, import_react.useState)([]);
 	const [closedTrades, setClosedTrades] = (0, import_react.useState)([]);
 	const [logs, setLogs] = (0, import_react.useState)([]);
@@ -14606,6 +15285,12 @@ function App() {
 			console.error("Error toggling bot:", e);
 		}
 		else {
+			if (newActiveState) setAccount((prev) => ({
+				...prev,
+				maxDrawdownReached: false,
+				dailyStartBalance: prev.balance,
+				maxEquity: prev.balance
+			}));
 			setBotActive(newActiveState);
 			setHasUnappliedChanges(false);
 		}
@@ -14643,128 +15328,296 @@ function App() {
 				const calculatedCandles = computeAllIndicators(newCandles, stratSettings);
 				const currentCandle = calculatedCandles[calculatedCandles.length - 1];
 				const currentPrice = currentCandle.close;
-				setActivePosition((currPos) => {
-					if (!currPos) return null;
-					let exitPrice = 0;
-					let exitReason = void 0;
-					const pnl = (currPos.type === "LONG" ? currentPrice - currPos.entryPrice : currPos.entryPrice - currentPrice) * currPos.size * currPos.leverage;
-					const pnlPercent = pnl / (currPos.entryPrice * currPos.size) * 100;
-					const updatedPos = {
-						...currPos,
-						pnl,
-						pnlPercent
-					};
-					if (currPos.type === "LONG") updatedPos.maxObservedPrice = Math.max(currPos.maxObservedPrice || currPos.entryPrice, currentPrice);
-					else updatedPos.minObservedPrice = Math.min(currPos.minObservedPrice || currPos.entryPrice, currentPrice);
-					if (riskSettings.trailingStopEnabled) {
-						const slDistance = Math.abs(currPos.entryPrice - currPos.stopLoss);
-						if (currPos.type === "LONG") {
-							const triggerPrice = currPos.entryPrice + slDistance * riskSettings.trailingStopTrigger;
-							if ((updatedPos.maxObservedPrice || 0) > triggerPrice) {
-								const newSL = parseFloat((currPos.entryPrice + slDistance * .2).toFixed(2));
-								if (newSL > currPos.stopLoss) {
-									updatedPos.stopLoss = newSL;
-									addLog(`Trailing Stop adjusted higher for LONG to $${newSL}. Trade is now risk-free!`, "info");
-								}
-							}
-						} else {
-							const triggerPrice = currPos.entryPrice - slDistance * riskSettings.trailingStopTrigger;
-							if ((updatedPos.minObservedPrice || Infinity) < triggerPrice) {
-								const newSL = parseFloat((currPos.entryPrice - slDistance * .2).toFixed(2));
-								if (newSL < currPos.stopLoss) {
-									updatedPos.stopLoss = newSL;
-									addLog(`Trailing Stop adjusted lower for SHORT to $${newSL}. Trade is now risk-free!`, "info");
-								}
-							}
-						}
-					}
-					if (currPos.type === "LONG") {
-						if (currentPrice <= updatedPos.stopLoss) {
-							exitPrice = updatedPos.stopLoss;
-							exitReason = riskSettings.trailingStopEnabled && exitPrice > currPos.entryPrice ? "TRAILING_STOP" : "SL";
-						} else if (currentPrice >= updatedPos.takeProfit) {
-							exitPrice = updatedPos.takeProfit;
-							exitReason = "TP";
-						}
-					} else if (currentPrice >= updatedPos.stopLoss) {
-						exitPrice = updatedPos.stopLoss;
-						exitReason = riskSettings.trailingStopEnabled && exitPrice < currPos.entryPrice ? "TRAILING_STOP" : "SL";
-					} else if (currentPrice <= updatedPos.takeProfit) {
-						exitPrice = updatedPos.takeProfit;
-						exitReason = "TP";
-					}
-					if (exitReason) {
-						const finalPnl = currPos.type === "LONG" ? (exitPrice - currPos.entryPrice) * currPos.size * currPos.leverage : (currPos.entryPrice - exitPrice) * currPos.size * currPos.leverage;
-						const closedPos = {
-							...updatedPos,
-							status: "CLOSED",
-							exitPrice,
-							exitTime: currentCandle.time,
-							exitReason,
-							pnl: finalPnl,
-							pnlPercent: finalPnl / (currPos.entryPrice * currPos.size) * 100
+				setSimulatorPositions((prevPositions) => {
+					if (prevPositions.length === 0) return [];
+					let updatedPositions = [...prevPositions];
+					const toCloseIds = [];
+					const nextPositions = [];
+					updatedPositions = updatedPositions.map((pos) => {
+						const pnl = (pos.type === "LONG" ? currentPrice - pos.entryPrice : pos.entryPrice - currentPrice) * pos.size * pos.leverage;
+						const pnlPercent = pnl / (pos.entryPrice * pos.size) * 100;
+						const updated = {
+							...pos,
+							pnl,
+							pnlPercent
 						};
-						setAccount((prevAcc) => {
-							const nextBalance = prevAcc.balance + finalPnl;
-							const isWin = finalPnl > 0;
-							return {
-								...prevAcc,
-								balance: nextBalance,
-								equity: nextBalance,
-								winCount: prevAcc.winCount + (isWin ? 1 : 0),
-								lossCount: prevAcc.lossCount + (isWin ? 0 : 1),
-								totalProfit: prevAcc.totalProfit + finalPnl
-							};
-						});
-						setClosedTrades((prevTrades) => [...prevTrades, closedPos]);
-						addLog(exitReason === "TP" ? `🎯 TAKE PROFIT hit at $${exitPrice.toFixed(2)}. Profit: +$${finalPnl.toFixed(2)}!` : exitReason === "TRAILING_STOP" ? `🛡️ TRAILING STOP hit at $${exitPrice.toFixed(2)}. Capital preserved, profit secured: +$${finalPnl.toFixed(2)}.` : `🛑 STOP LOSS hit at $${exitPrice.toFixed(2)}. Loss locked: -$${Math.abs(finalPnl).toFixed(2)}.`, exitReason === "TP" || exitReason === "TRAILING_STOP" ? "success" : "danger");
-						lastExitTimeRef.current = currentCandle.time;
-						return null;
-					}
-					return updatedPos;
-				});
-				if (isNewCandle && !activePosition) {
-					if (lastExitTimeRef.current && currentCandle.time - lastExitTimeRef.current < 900 * 1e3) return calculatedCandles;
-					const decision = evaluateStrategy(calculatedCandles, stratSettings);
-					if (decision.signal) {
-						const slDistance = (currentCandle.atr || currentCandle.high - currentCandle.low || 5) * riskSettings.atrMultiplier;
-						let slPrice = 0;
-						let tpPrice = 0;
-						if (decision.signal === "BUY") {
-							slPrice = currentPrice - slDistance;
-							tpPrice = currentPrice + slDistance * riskSettings.riskRewardRatio;
-						} else {
-							slPrice = currentPrice + slDistance;
-							tpPrice = currentPrice - slDistance * riskSettings.riskRewardRatio;
+						updated.maxLeveragedPnL = Math.max(updated.maxLeveragedPnL || 0, pnlPercent);
+						if (pos.type === "LONG") updated.maxObservedPrice = Math.max(pos.maxObservedPrice || pos.entryPrice, currentPrice);
+						else updated.minObservedPrice = Math.min(pos.minObservedPrice || pos.entryPrice, currentPrice);
+						return updated;
+					});
+					for (const pos of updatedPositions) {
+						if (toCloseIds.includes(pos.id)) continue;
+						let exitPrice = 0;
+						let exitReason = void 0;
+						if (pos.isHedgedPair) {
+							const paired = updatedPositions.find((p) => p.id === pos.pairedPositionId && !toCloseIds.includes(p.id));
+							const role = pos.hedgedRole;
+							if (role === "PRIMARY") {
+								if (pos.pnlPercent >= 50) {
+									exitPrice = currentPrice;
+									exitReason = "TP";
+									toCloseIds.push(pos.id);
+									if (paired) paired.hedgedScenario = "A";
+									addLog(`[HEDGE ENGINE] Simulator: Scenario A triggered for MOCKUSDT: Primary reached +50% PnL. Closing...`, "success");
+								} else if (pos.pnlPercent >= 60 || pos.hedgedScenario === "C") {
+									if (pos.hedgedScenario !== "C") {
+										pos.hedgedScenario = "C";
+										if (paired) paired.hedgedScenario = "C";
+										addLog(`[HEDGE ENGINE] Simulator: Scenario C triggered for MOCKUSDT: Primary reached +60% PnL. Trailing Profit active.`, "success");
+									}
+									const trailingFloor = .3 * (pos.maxLeveragedPnL || 0);
+									if (pos.pnlPercent < trailingFloor) {
+										exitPrice = currentPrice;
+										exitReason = "TRAILING_STOP";
+										toCloseIds.push(pos.id);
+										addLog(`[HEDGE ENGINE] Simulator: Trailing Stop hit for Primary. Closed at ${pos.pnlPercent.toFixed(1)}% PnL.`, "warning");
+									}
+								} else if (pos.hedgedScenario === "B") {
+									if (pos.pnlPercent >= 40) {
+										exitPrice = currentPrice;
+										exitReason = "TP";
+										toCloseIds.push(pos.id);
+										addLog(`[HEDGE ENGINE] Simulator: Scenario B recovery hit. Primary closed at +40% PnL.`, "success");
+									}
+								}
+							} else if (role === "HEDGE") {
+								if (pos.hedgedScenario === "A") {
+									if (pos.pnlPercent >= 10) {
+										exitPrice = currentPrice;
+										exitReason = "TP";
+										toCloseIds.push(pos.id);
+										addLog(`[HEDGE ENGINE] Simulator: Scenario A Hedge profit target (+10%) hit. Closing...`, "success");
+									} else if (pos.pnlPercent <= -10) {
+										exitPrice = currentPrice;
+										exitReason = "SL";
+										toCloseIds.push(pos.id);
+										addLog(`[HEDGE ENGINE] Simulator: Scenario A Hedge stop loss (-10%) hit. Closing...`, "danger");
+									}
+								} else if (pos.pnlPercent >= 70 && paired && paired.pnlPercent < 0) {
+									exitPrice = currentPrice;
+									exitReason = "TP";
+									toCloseIds.push(pos.id);
+									paired.hedgedScenario = "B";
+									addLog(`[HEDGE ENGINE] Simulator: Scenario B triggered. Hedge reached +70% PnL. Closing hedge.`, "success");
+								} else if (pos.hedgedScenario === "C") {
+									if (pos.pnlPercent <= -80) {
+										exitPrice = currentPrice;
+										exitReason = "SL";
+										toCloseIds.push(pos.id);
+										addLog(`[HEDGE ENGINE] Simulator: Scenario C Hedge hit stop loss (-80% PnL). Closing...`, "danger");
+									} else if (pos.pnlPercent >= 10) {
+										exitPrice = currentPrice;
+										exitReason = "TP";
+										toCloseIds.push(pos.id);
+										addLog(`[HEDGE ENGINE] Simulator: Scenario C Hedge hit profit target (+10% PnL). Closing...`, "success");
+									}
+								}
+							}
 						}
-						setAccount((currAcc) => {
-							let size = currAcc.balance * (riskSettings.riskPercent / 100) / slDistance;
-							const exposure = size * currentPrice;
-							const maxAllowedExposure = currAcc.balance * riskSettings.leverage;
-							if (exposure > maxAllowedExposure) size = maxAllowedExposure / currentPrice;
-							const newPos = {
-								id: `trade_${Date.now()}`,
-								type: decision.signal === "BUY" ? "LONG" : "SHORT",
-								symbol: "MOCKUSDT",
-								entryPrice: currentPrice,
-								entryTime: currentCandle.time,
-								size,
-								leverage: riskSettings.leverage,
-								stopLoss: parseFloat(slPrice.toFixed(2)),
-								takeProfit: parseFloat(tpPrice.toFixed(2)),
-								pnl: 0,
-								pnlPercent: 0,
-								status: "OPEN",
-								maxObservedPrice: currentPrice,
-								minObservedPrice: currentPrice
+						if (!exitReason) {
+							if (pos.type === "LONG") {
+								if (currentPrice <= pos.stopLoss) {
+									exitPrice = pos.stopLoss;
+									exitReason = riskSettings.trailingStopEnabled && exitPrice > pos.entryPrice ? "TRAILING_STOP" : "SL";
+									toCloseIds.push(pos.id);
+								} else if (currentPrice >= pos.takeProfit) {
+									exitPrice = pos.takeProfit;
+									exitReason = "TP";
+									toCloseIds.push(pos.id);
+								}
+							} else if (currentPrice >= pos.stopLoss) {
+								exitPrice = pos.stopLoss;
+								exitReason = riskSettings.trailingStopEnabled && exitPrice < pos.entryPrice ? "TRAILING_STOP" : "SL";
+								toCloseIds.push(pos.id);
+							} else if (currentPrice <= pos.takeProfit) {
+								exitPrice = pos.takeProfit;
+								exitReason = "TP";
+								toCloseIds.push(pos.id);
+							}
+						}
+						if (exitReason) {
+							const finalPnl = pos.type === "LONG" ? (exitPrice - pos.entryPrice) * pos.size * pos.leverage : (pos.entryPrice - exitPrice) * pos.size * pos.leverage;
+							const closedPos = {
+								...pos,
+								status: "CLOSED",
+								exitPrice,
+								exitTime: currentCandle.time,
+								exitReason,
+								pnl: finalPnl,
+								pnlPercent: finalPnl / (pos.entryPrice * pos.size) * 100
 							};
-							setActivePosition(newPos);
-							addLog(`🔔 Trade Signal triggered: ${decision.reason}`, "trade");
-							addLog(`📥 Executed ${newPos.type} Order. Size: ${size.toFixed(4)} MOCK ($${(size * currentPrice).toFixed(2)} exposure). SL: $${slPrice.toFixed(2)}, TP: $${tpPrice.toFixed(2)}. Calculated potential loss is exactly $${(size * slDistance).toFixed(2)} (${riskSettings.riskPercent}% risk).`, "info");
-							return currAcc;
-						});
+							setAccount((prevAcc) => {
+								const nextBalance = prevAcc.balance + finalPnl;
+								const isWin = finalPnl > 0;
+								return {
+									...prevAcc,
+									balance: nextBalance,
+									equity: nextBalance,
+									winCount: prevAcc.winCount + (isWin ? 1 : 0),
+									lossCount: prevAcc.lossCount + (isWin ? 0 : 1),
+									totalProfit: prevAcc.totalProfit + finalPnl
+								};
+							});
+							setClosedTrades((prevTrades) => [...prevTrades, closedPos]);
+							addLog(exitReason === "TP" ? `🎯 TAKE PROFIT hit at $${exitPrice.toFixed(2)}. Profit: +$${finalPnl.toFixed(2)}!` : exitReason === "TRAILING_STOP" ? `🛡️ TRAILING STOP hit at $${exitPrice.toFixed(2)}. Capital preserved, profit secured: +$${finalPnl.toFixed(2)}.` : `🛑 STOP LOSS hit at $${exitPrice.toFixed(2)}. Loss locked: -$${Math.abs(finalPnl).toFixed(2)}.`, exitReason === "TP" || exitReason === "TRAILING_STOP" ? "success" : "danger");
+							lastExitTimeRef.current = currentCandle.time;
+						} else nextPositions.push(pos);
 					}
-				}
+					let netUnrealizedPnL = 0;
+					nextPositions.forEach((pos) => {
+						netUnrealizedPnL += pos.pnl || 0;
+					});
+					const currentEquity = account.balance + netUnrealizedPnL;
+					const nextMaxEquity = Math.max(account.maxEquity || currentEquity, currentEquity);
+					let dailyDD = 0;
+					if (account.dailyStartBalance > 0 && currentEquity < account.dailyStartBalance) dailyDD = (account.dailyStartBalance - currentEquity) / account.dailyStartBalance * 100;
+					let portfolioDD = 0;
+					if (nextMaxEquity > 0) portfolioDD = (nextMaxEquity - currentEquity) / nextMaxEquity * 100;
+					const maxDailyDD = riskSettings.maxDailyDrawdown;
+					const maxPortfolioDD = riskSettings.maxPortfolioDrawdown || 10;
+					if ((dailyDD >= maxDailyDD || portfolioDD >= maxPortfolioDD) && !account.maxDrawdownReached) {
+						const reason = dailyDD >= maxDailyDD ? `Daily Max Drawdown limit (${maxDailyDD}%) hit! (Current: -${dailyDD.toFixed(2)}%)` : `Portfolio Max Drawdown limit (${maxPortfolioDD}%) hit! (Current: -${portfolioDD.toFixed(2)}%)`;
+						setTimeout(() => {
+							setBotActive(false);
+							addLog(`[CRITICAL] Simulator: ${reason}. Triggering Emergency Circuit Breaker. Closing all positions...`, "danger");
+							setSimulatorPositions((activePos) => {
+								const closedList = activePos.map((pos) => {
+									const finalPnl = (pos.type === "LONG" ? currentPrice - pos.entryPrice : pos.entryPrice - currentPrice) * pos.size * pos.leverage;
+									return {
+										...pos,
+										status: "CLOSED",
+										exitPrice: currentPrice,
+										exitTime: currentCandle.time,
+										exitReason: "DRAWDOWN",
+										pnl: finalPnl,
+										pnlPercent: finalPnl / (pos.entryPrice * pos.size) * 100
+									};
+								});
+								setClosedTrades((prev) => [...prev, ...closedList]);
+								const totalClosedPnl = closedList.reduce((sum, p) => sum + p.pnl, 0);
+								setAccount((pa) => ({
+									...pa,
+									balance: pa.balance + totalClosedPnl,
+									equity: pa.balance + totalClosedPnl,
+									maxEquity: Math.max(pa.maxEquity, pa.balance + totalClosedPnl),
+									maxDrawdownReached: true,
+									lossCount: pa.lossCount + closedList.length,
+									totalProfit: pa.totalProfit + totalClosedPnl
+								}));
+								return [];
+							});
+						}, 0);
+					} else setTimeout(() => {
+						setAccount((prev) => {
+							if (Math.abs(prev.equity - currentEquity) > .01 || Math.abs(prev.maxEquity - nextMaxEquity) > .01) return {
+								...prev,
+								equity: currentEquity,
+								maxEquity: nextMaxEquity
+							};
+							return prev;
+						});
+					}, 0);
+					return nextPositions;
+				});
+				if (isNewCandle) setSimulatorPositions((prevPositions) => {
+					if (Array.from(new Set(prevPositions.map((p) => p.symbol))).length >= (riskSettings.maxConcurrentPositions || 3)) return prevPositions;
+					if (lastExitTimeRef.current && currentCandle.time - lastExitTimeRef.current < 900 * 1e3) return prevPositions;
+					const decision = evaluateStrategy(calculatedCandles, stratSettings);
+					if (!decision.signal) return prevPositions;
+					const atrValue = currentCandle.atr || currentCandle.high - currentCandle.low || 1;
+					const atrPercent = atrValue / currentPrice * 100;
+					const atrMin = riskSettings.volatilityAtrMin !== void 0 ? riskSettings.volatilityAtrMin : .05;
+					if (atrPercent < atrMin) {
+						addLog(`Volatility Protection: Signal skipped for MOCKUSDT due to ATR ${atrPercent.toFixed(3)}% < minimum ${atrMin}%`, "warning");
+						return prevPositions;
+					}
+					const slDistance = atrValue * riskSettings.atrMultiplier;
+					let size = account.balance * (riskSettings.riskPercent / 100) / slDistance;
+					const totalCapitalRequired = size * currentPrice;
+					const maxAllowedExposure = account.balance * riskSettings.leverage;
+					if (totalCapitalRequired > maxAllowedExposure) size = maxAllowedExposure / currentPrice;
+					addLog(`🔔 Trade Signal triggered: ${decision.reason}`, "trade");
+					if (riskSettings.hedgedDualExecutionEnabled) {
+						const primaryId = `sim_pri_${Date.now()}`;
+						const hedgeId = `sim_hdg_${Date.now()}`;
+						const primaryType = decision.signal === "BUY" ? "LONG" : "SHORT";
+						const hedgeType = primaryType === "LONG" ? "SHORT" : "LONG";
+						let primarySl = primaryType === "LONG" ? currentPrice - slDistance : currentPrice + slDistance;
+						let primaryTp = primaryType === "LONG" ? currentPrice + slDistance * riskSettings.riskRewardRatio : currentPrice - slDistance * riskSettings.riskRewardRatio;
+						const primaryPos = {
+							id: primaryId,
+							type: primaryType,
+							symbol: "MOCKUSDT",
+							entryPrice: currentPrice,
+							entryTime: currentCandle.time,
+							size,
+							leverage: riskSettings.leverage,
+							stopLoss: parseFloat(primarySl.toFixed(2)),
+							takeProfit: parseFloat(primaryTp.toFixed(2)),
+							pnl: 0,
+							pnlPercent: 0,
+							status: "OPEN",
+							maxObservedPrice: currentPrice,
+							minObservedPrice: currentPrice,
+							isHedgedPair: true,
+							hedgedRole: "PRIMARY",
+							hedgedScenario: "NONE",
+							pairedPositionId: hedgeId,
+							maxLeveragedPnL: 0
+						};
+						let hedgeSl = hedgeType === "LONG" ? currentPrice - slDistance : currentPrice + slDistance;
+						let hedgeTp = hedgeType === "LONG" ? currentPrice + slDistance * riskSettings.riskRewardRatio : currentPrice - slDistance * riskSettings.riskRewardRatio;
+						const hedgePos = {
+							id: hedgeId,
+							type: hedgeType,
+							symbol: "MOCKUSDT",
+							entryPrice: currentPrice,
+							entryTime: currentCandle.time,
+							size,
+							leverage: Math.max(1, Math.round(riskSettings.leverage / 2)),
+							stopLoss: parseFloat(hedgeSl.toFixed(2)),
+							takeProfit: parseFloat(hedgeTp.toFixed(2)),
+							pnl: 0,
+							pnlPercent: 0,
+							status: "OPEN",
+							maxObservedPrice: currentPrice,
+							minObservedPrice: currentPrice,
+							isHedgedPair: true,
+							hedgedRole: "HEDGE",
+							hedgedScenario: "NONE",
+							pairedPositionId: primaryId,
+							maxLeveragedPnL: 0
+						};
+						addLog(`📥 Executed Simulator Hedged Dual Entry. Primary: ${primaryType} (${riskSettings.leverage}X), Hedge: ${hedgeType} (${Math.max(1, Math.round(riskSettings.leverage / 2))}X).`, "info");
+						return [
+							...prevPositions,
+							primaryPos,
+							hedgePos
+						];
+					} else {
+						let slPrice = decision.signal === "BUY" ? currentPrice - slDistance : currentPrice + slDistance;
+						let tpPrice = decision.signal === "BUY" ? currentPrice + slDistance * riskSettings.riskRewardRatio : currentPrice - slDistance * riskSettings.riskRewardRatio;
+						const singlePos = {
+							id: `sim_single_${Date.now()}`,
+							type: decision.signal === "BUY" ? "LONG" : "SHORT",
+							symbol: "MOCKUSDT",
+							entryPrice: currentPrice,
+							entryTime: currentCandle.time,
+							size,
+							leverage: riskSettings.leverage,
+							stopLoss: parseFloat(slPrice.toFixed(2)),
+							takeProfit: parseFloat(tpPrice.toFixed(2)),
+							pnl: 0,
+							pnlPercent: 0,
+							status: "OPEN",
+							maxObservedPrice: currentPrice,
+							minObservedPrice: currentPrice
+						};
+						addLog(`📥 Executed Simulator Single Position Entry: ${singlePos.type}.`, "info");
+						return [...prevPositions, singlePos];
+					}
+				});
 				return calculatedCandles;
 			});
 		}, 1e3);
@@ -14775,7 +15628,7 @@ function App() {
 		botActive,
 		stratSettings,
 		riskSettings,
-		activePosition
+		simulatorPositions
 	]);
 	const handleManualClose = async (symbolToClose) => {
 		if (botMode === "EXCHANGE_LIVE") {
@@ -14798,33 +15651,38 @@ function App() {
 			}
 			return;
 		}
-		if (!activePosition) return;
-		const currentPrice = candles[candles.length - 1].close;
-		const finalPnl = activePosition.type === "LONG" ? (currentPrice - activePosition.entryPrice) * activePosition.size * activePosition.leverage : (activePosition.entryPrice - currentPrice) * activePosition.size * activePosition.leverage;
-		const closedPos = {
-			...activePosition,
-			status: "CLOSED",
-			exitPrice: currentPrice,
-			exitTime: Date.now(),
-			exitReason: "MANUAL",
-			pnl: finalPnl,
-			pnlPercent: finalPnl / (activePosition.entryPrice * activePosition.size) * 100
-		};
-		setAccount((prevAcc) => {
-			const nextBalance = prevAcc.balance + finalPnl;
-			return {
-				...prevAcc,
-				balance: nextBalance,
-				equity: nextBalance,
-				winCount: prevAcc.winCount + (finalPnl > 0 ? 1 : 0),
-				lossCount: prevAcc.lossCount + (finalPnl <= 0 ? 1 : 0),
-				totalProfit: prevAcc.totalProfit + finalPnl
-			};
+		const targetSymbol = symbolToClose || "MOCKUSDT";
+		setSimulatorPositions((prevPositions) => {
+			const remaining = [];
+			const currentPrice = candles[candles.length - 1].close;
+			for (const pos of prevPositions) if (pos.symbol === targetSymbol || targetSymbol === "MOCKUSDT") {
+				const finalPnl = pos.type === "LONG" ? (currentPrice - pos.entryPrice) * pos.size * pos.leverage : (pos.entryPrice - currentPrice) * pos.size * pos.leverage;
+				const closedPos = {
+					...pos,
+					status: "CLOSED",
+					exitPrice: currentPrice,
+					exitTime: Date.now(),
+					exitReason: "MANUAL",
+					pnl: finalPnl,
+					pnlPercent: finalPnl / (pos.entryPrice * pos.size) * 100
+				};
+				setAccount((prevAcc) => {
+					const nextBalance = prevAcc.balance + finalPnl;
+					return {
+						...prevAcc,
+						balance: nextBalance,
+						equity: nextBalance,
+						winCount: prevAcc.winCount + (finalPnl > 0 ? 1 : 0),
+						lossCount: prevAcc.lossCount + (finalPnl <= 0 ? 1 : 0),
+						totalProfit: prevAcc.totalProfit + finalPnl
+					};
+				});
+				setClosedTrades((prevTrades) => [...prevTrades, closedPos]);
+				addLog(`⚠️ POSITION CLOSED MANUALLY at $${currentPrice.toFixed(2)}. PnL: ${finalPnl >= 0 ? "+" : ""}$${finalPnl.toFixed(2)}.`, "warning");
+			} else remaining.push(pos);
+			return remaining;
 		});
-		setClosedTrades((prevTrades) => [...prevTrades, closedPos]);
-		setActivePosition(null);
 		lastExitTimeRef.current = Date.now();
-		addLog(`⚠️ POSITION CLOSED MANUALLY at $${currentPrice.toFixed(2)}. PnL: ${finalPnl >= 0 ? "+" : ""}$${finalPnl.toFixed(2)}.`, "warning");
 	};
 	const handleRunBacktest = (regime) => {
 		addLog(`Running historical backtest on ${regime.replace("_", " ")} (500 candles)...`, "info");
@@ -14843,6 +15701,8 @@ function App() {
 		return losses === 0 ? wins > 0 ? 99.9 : 0 : wins / losses;
 	};
 	const currentPrice = candles.length > 0 ? candles[candles.length - 1].close : 5e4;
+	const currentActivePosition = botMode === "EXCHANGE_LIVE" ? allPositions.length > 0 ? allPositions[0] : null : simulatorPositions.length > 0 ? simulatorPositions[0] : null;
+	const currentAllPositions = botMode === "EXCHANGE_LIVE" ? allPositions : simulatorPositions;
 	if (!userToken) return /* @__PURE__ */ (0, import_jsx_runtime.jsx)(AuthPage, { onLoginSuccess: handleLoginSuccess });
 	return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 		className: "app-container",
@@ -15036,7 +15896,7 @@ function App() {
 								}),
 								/* @__PURE__ */ (0, import_jsx_runtime.jsx)(TradingChart, {
 									candles,
-									activePosition,
+									activePosition: currentActivePosition,
 									closedTrades,
 									showIndicators,
 									symbol: viewedSymbol
@@ -15048,13 +15908,14 @@ function App() {
 										results: backtestResults,
 										riskSettings
 									}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)(TradeLogs, {
-										activePosition,
+										activePosition: currentActivePosition,
 										closedTrades,
 										logs,
 										onClosePosition: handleManualClose,
 										latestPrice: currentPrice,
-										allPositions: botMode === "EXCHANGE_LIVE" ? allPositions : activePosition ? [activePosition] : [],
-										evaluationStates
+										allPositions: currentAllPositions,
+										evaluationStates,
+										accountBalance: account.balance
 									})]
 								})
 							]
