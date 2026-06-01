@@ -15051,7 +15051,7 @@ function App() {
 		bb: false
 	});
 	const [candles, setCandles] = (0, import_react.useState)([]);
-	const [activePosition, setActivePosition] = (0, import_react.useState)(null);
+	const [_activePosition, setActivePosition] = (0, import_react.useState)(null);
 	const [simulatorPositions, setSimulatorPositions] = (0, import_react.useState)([]);
 	const [allPositions, setAllPositions] = (0, import_react.useState)([]);
 	const [closedTrades, setClosedTrades] = (0, import_react.useState)([]);

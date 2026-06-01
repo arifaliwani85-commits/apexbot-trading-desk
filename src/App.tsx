@@ -93,7 +93,7 @@ export default function App() {
 
   // --- Bot/Simulator States ---
   const [candles, setCandles] = useState<Candle[]>([]);
-  const [activePosition, setActivePosition] = useState<Position | null>(null);
+  const [_activePosition, setActivePosition] = useState<Position | null>(null);
   const [simulatorPositions, setSimulatorPositions] = useState<Position[]>([]);
   const [allPositions, setAllPositions] = useState<Position[]>([]);
   const [closedTrades, setClosedTrades] = useState<Position[]>([]);
@@ -453,7 +453,7 @@ export default function App() {
           if (prevPositions.length === 0) return [];
 
           let updatedPositions = [...prevPositions];
-          const toCloseIds = [];
+          const toCloseIds: string[] = [];
           const nextPositions = [];
 
           // Compute floating PnLs and peak extremes first
@@ -480,7 +480,7 @@ export default function App() {
             if (toCloseIds.includes(pos.id)) continue;
 
             let exitPrice = 0;
-            let exitReason = undefined;
+            let exitReason: 'SL' | 'TP' | 'MANUAL' | 'TRAILING_STOP' | 'DRAWDOWN' | undefined = undefined;
 
             if (pos.isHedgedPair) {
               const paired = updatedPositions.find(p => p.id === pos.pairedPositionId && !toCloseIds.includes(p.id));
