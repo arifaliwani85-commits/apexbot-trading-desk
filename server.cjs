@@ -214,6 +214,7 @@ function getOrCreateSession(username) {
     positionsLastFetched: 0,
     forceRefreshExchangeData: false,
     exchangePositionModeChecked: false,
+    exchangeMarginModes: {},
     stratSettings: profile.stratSettings || {
       strategyType: 'TREND_FOLLOWING',
       emaShortPeriod: 20,
@@ -263,6 +264,7 @@ function getOrCreateSession(username) {
         session.exchangeConfig = creds;
         session.isHedgeMode = (creds.positionMode === 'HEDGE');
         session.exchangePositionModeChecked = false;
+        session.exchangeMarginModes = {};
 
         const ccxtExchangeId = creds.exchangeId === 'kucoin' ? 'kucoinfutures' : creds.exchangeId;
         const exchangeClass = getCcxt()[ccxtExchangeId];
@@ -403,6 +405,30 @@ async function getExchangePositionMode(session, symbol) {
     session.addLog(`Position Mode Query Warning for ${symbol}: ${err.message}`, 'warning');
   }
   return session.isHedgeMode ? 'HEDGE' : 'ONE_WAY';
+}
+
+async function getExchangeMarginMode(session, symbol) {
+  if (!session.exchangeInstance) return 'CROSS';
+  if (session.exchangeConfig?.exchangeId !== 'kucoin') return 'CROSS';
+  
+  const cacheKey = symbol;
+  session.exchangeMarginModes = session.exchangeMarginModes || {};
+  if (session.exchangeMarginModes[cacheKey]) {
+    return session.exchangeMarginModes[cacheKey];
+  }
+
+  try {
+    const marketSymbol = getMarketSymbol(session, symbol);
+    const modeRes = await callExchange(session, 'fetchMarginMode', marketSymbol);
+    if (modeRes && modeRes.marginMode) {
+      const mode = modeRes.marginMode.toUpperCase(); // 'ISOLATED' or 'CROSS'
+      session.exchangeMarginModes[cacheKey] = mode;
+      return mode;
+    }
+  } catch (err) {
+    session.addLog(`Failed to fetch margin mode for ${symbol}: ${err.message}`, 'warning');
+  }
+  return 'CROSS';
 }
 
 async function callExchange(session, method, ...args) {
@@ -659,6 +685,8 @@ async function setExchangeStopLossTakeProfit(session, symbol, positionIdx, stopL
         return false;
       }
 
+      const marginMode = await getExchangeMarginMode(session, symbol);
+
       // 3. Attach Stop Loss stop order
       if (stopLoss) {
         const slPriceFormatted = parseFloat(session.exchangeInstance.priceToPrecision(marketSymbol, parseFloat(stopLoss)));
@@ -667,7 +695,8 @@ async function setExchangeStopLossTakeProfit(session, symbol, positionIdx, stopL
         const slParams = {
           stopLossPrice: slPriceFormatted,
           stopPriceType: 'TP',
-          reduceOnly: true
+          reduceOnly: true,
+          marginMode: marginMode
         };
         if (session.isHedgeMode) {
           slParams.posSide = posType === 'LONG' ? 'long' : 'short';
@@ -684,7 +713,8 @@ async function setExchangeStopLossTakeProfit(session, symbol, positionIdx, stopL
         const tpParams = {
           takeProfitPrice: tpPriceFormatted,
           stopPriceType: 'TP',
-          reduceOnly: true
+          reduceOnly: true,
+          marginMode: marginMode
         };
         if (session.isHedgeMode) {
           tpParams.posSide = posType === 'LONG' ? 'long' : 'short';
@@ -998,6 +1028,15 @@ async function safeCreateMarketOrder(session, symbol, side, amount, params = {},
     // Strip stopLoss and takeProfit to avoid KuCoin Futures margin mode mismatch (error 330005)
     delete cleanParams.stopLoss;
     delete cleanParams.takeProfit;
+
+    // Fetch and pass current margin mode explicitly to resolve error 330005
+    try {
+      const marginMode = await getExchangeMarginMode(session, symbol);
+      cleanParams.marginMode = marginMode;
+      addLog(`[KuCoin Margin Mode] Explicitly passing marginMode: ${cleanParams.marginMode} to match symbol setting.`, 'info');
+    } catch (modeErr) {
+      addLog(`[KuCoin Margin Mode] Warning: Failed to retrieve margin mode: ${modeErr.message}`, 'warning');
+    }
   } else if (exchangeId === 'kraken') {
     delete cleanParams.positionIdx;
   }
@@ -1829,6 +1868,7 @@ app.post('/api/connect', requireAuth, async (req, res) => {
     session.exchangeConfig = { exchangeId, apiKey, apiSecret, apiPassphrase, positionMode, isTestnet };
     session.isHedgeMode = (positionMode === 'HEDGE');
     session.exchangePositionModeChecked = false;
+    session.exchangeMarginModes = {};
     session.circuitBreakerTriggered = false; // Reset circuit breaker on successful connection
     
     // Attempt to set position mode on exchange
@@ -1890,6 +1930,7 @@ app.post('/api/disconnect', requireAuth, (req, res) => {
   session.exchangeConfig = { exchangeId: 'binance', apiKey: '', apiSecret: '', isTestnet: true };
   session.botActive = false;
   session.exchangePositionModeChecked = false;
+  session.exchangeMarginModes = {};
   
   const profile = loadUserProfile(session.username);
   if (profile) {
