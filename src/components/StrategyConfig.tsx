@@ -36,7 +36,7 @@ interface StrategyConfigProps {
     maskedApiSecret?: string;
     isHedgeMode?: boolean;
   };
-  onConnectExchange: (exchangeId: string, apiKey: string, apiSecret: string, isTestnet: boolean, apiPassphrase?: string) => Promise<boolean>;
+  onConnectExchange: (exchangeId: string, apiKey: string, apiSecret: string, isTestnet: boolean, apiPassphrase?: string, positionMode?: string) => Promise<boolean>;
   onDisconnectExchange: () => void;
   symbol: string;
   setSymbol: (s: string) => void;
@@ -66,6 +66,7 @@ export const StrategyConfig: React.FC<StrategyConfigProps> = ({
   const [apiSecret, setApiSecret] = useState('');
   const [apiPassphrase, setApiPassphrase] = useState('');
   const [isTestnet, setIsTestnet] = useState(true);
+  const [positionMode, setPositionMode] = useState('ONE_WAY');
   const [connecting, setConnecting] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
   const [isEditing, setIsEditing] = useState(false);
@@ -81,8 +82,16 @@ export const StrategyConfig: React.FC<StrategyConfigProps> = ({
     setIsTestnet(exchangeStatus.isTestnet !== false);
     setApiKey(exchangeStatus.maskedApiKey || '');
     setApiSecret(exchangeStatus.maskedApiSecret || '');
+    setPositionMode(exchangeStatus.isHedgeMode ? 'HEDGE' : 'ONE_WAY');
     setIsEditing(false); // Reset editing first to refresh form
     setTimeout(() => setIsEditing(true), 0);
+  };
+
+  const handleExchangeChange = (id: string) => {
+    setExchangeId(id);
+    if (id === 'kucoin' || id === 'kraken') {
+      setPositionMode('ONE_WAY');
+    }
   };
 
   const handleStrategyChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
@@ -126,7 +135,7 @@ export const StrategyConfig: React.FC<StrategyConfigProps> = ({
     setErrorMessage('');
     setConnecting(true);
     try {
-      const ok = await onConnectExchange(exchangeId, apiKey, apiSecret, isTestnet, apiPassphrase);
+      const ok = await onConnectExchange(exchangeId, apiKey, apiSecret, isTestnet, apiPassphrase, positionMode);
       if (ok) {
         setApiKey('');
         setApiSecret('');
@@ -324,12 +333,22 @@ export const StrategyConfig: React.FC<StrategyConfigProps> = ({
             <form onSubmit={handleConnect} style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
               <div className="form-group" style={{ marginBottom: '8px' }}>
                 <label className="form-label">Exchange ID</label>
-                <select className="select-input" value={exchangeId} onChange={(e) => setExchangeId(e.target.value)}>
+                <select className="select-input" value={exchangeId} onChange={(e) => handleExchangeChange(e.target.value)}>
                   <option value="binance">Binance</option>
                   <option value="bybit">Bybit</option>
                   <option value="okx">OKX</option>
                   <option value="kraken">Kraken</option>
                   <option value="kucoin">KuCoin</option>
+                </select>
+              </div>
+
+              <div className="form-group" style={{ marginBottom: '8px' }}>
+                <label className="form-label">Position Mode</label>
+                <select className="select-input" value={positionMode} onChange={(e) => setPositionMode(e.target.value)}>
+                  <option value="ONE_WAY">One-Way Mode</option>
+                  {(exchangeId === 'binance' || exchangeId === 'bybit' || exchangeId === 'okx') && (
+                    <option value="HEDGE">Hedge Mode (Dual)</option>
+                  )}
                 </select>
               </div>
 

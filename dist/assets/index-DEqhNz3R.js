@@ -11796,6 +11796,7 @@ var StrategyConfig = ({ stratSettings, setStratSettings, riskSettings, setRiskSe
 	const [apiSecret, setApiSecret] = (0, import_react.useState)("");
 	const [apiPassphrase, setApiPassphrase] = (0, import_react.useState)("");
 	const [isTestnet, setIsTestnet] = (0, import_react.useState)(true);
+	const [positionMode, setPositionMode] = (0, import_react.useState)("ONE_WAY");
 	const [connecting, setConnecting] = (0, import_react.useState)(false);
 	const [errorMessage, setErrorMessage] = (0, import_react.useState)("");
 	const [isEditing, setIsEditing] = (0, import_react.useState)(false);
@@ -11807,8 +11808,13 @@ var StrategyConfig = ({ stratSettings, setStratSettings, riskSettings, setRiskSe
 		setIsTestnet(exchangeStatus.isTestnet !== false);
 		setApiKey(exchangeStatus.maskedApiKey || "");
 		setApiSecret(exchangeStatus.maskedApiSecret || "");
+		setPositionMode(exchangeStatus.isHedgeMode ? "HEDGE" : "ONE_WAY");
 		setIsEditing(false);
 		setTimeout(() => setIsEditing(true), 0);
+	};
+	const handleExchangeChange = (id) => {
+		setExchangeId(id);
+		if (id === "kucoin" || id === "kraken") setPositionMode("ONE_WAY");
 	};
 	const handleStrategyChange = (e) => {
 		setStratSettings((prev) => ({
@@ -11847,7 +11853,7 @@ var StrategyConfig = ({ stratSettings, setStratSettings, riskSettings, setRiskSe
 		setErrorMessage("");
 		setConnecting(true);
 		try {
-			if (await onConnectExchange(exchangeId, apiKey, apiSecret, isTestnet, apiPassphrase)) {
+			if (await onConnectExchange(exchangeId, apiKey, apiSecret, isTestnet, apiPassphrase, positionMode)) {
 				setApiKey("");
 				setApiSecret("");
 				setApiPassphrase("");
@@ -12187,7 +12193,7 @@ var StrategyConfig = ({ stratSettings, setStratSettings, riskSettings, setRiskSe
 							}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("select", {
 								className: "select-input",
 								value: exchangeId,
-								onChange: (e) => setExchangeId(e.target.value),
+								onChange: (e) => handleExchangeChange(e.target.value),
 								children: [
 									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
 										value: "binance",
@@ -12210,6 +12216,25 @@ var StrategyConfig = ({ stratSettings, setStratSettings, riskSettings, setRiskSe
 										children: "KuCoin"
 									})
 								]
+							})]
+						}),
+						/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+							className: "form-group",
+							style: { marginBottom: "8px" },
+							children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("label", {
+								className: "form-label",
+								children: "Position Mode"
+							}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("select", {
+								className: "select-input",
+								value: positionMode,
+								onChange: (e) => setPositionMode(e.target.value),
+								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+									value: "ONE_WAY",
+									children: "One-Way Mode"
+								}), (exchangeId === "binance" || exchangeId === "bybit" || exchangeId === "okx") && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+									value: "HEDGE",
+									children: "Hedge Mode (Dual)"
+								})]
 							})]
 						}),
 						/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
@@ -15468,7 +15493,7 @@ function App() {
 		userToken,
 		hasUnappliedChanges
 	]);
-	const handleConnectExchange = async (exchangeId, apiKey, apiSecret, isTestnet, apiPassphrase) => {
+	const handleConnectExchange = async (exchangeId, apiKey, apiSecret, isTestnet, apiPassphrase, positionMode) => {
 		try {
 			const res = await fetch("/api/connect", {
 				method: "POST",
@@ -15481,7 +15506,8 @@ function App() {
 					apiKey,
 					apiSecret,
 					isTestnet,
-					apiPassphrase
+					apiPassphrase,
+					positionMode
 				})
 			});
 			if (res.status === 401) {

@@ -311,7 +311,8 @@ export default function App() {
     apiKey: string,
     apiSecret: string,
     isTestnet: boolean,
-    apiPassphrase?: string
+    apiPassphrase?: string,
+    positionMode?: string
   ): Promise<boolean> => {
     try {
       const res = await fetch('/api/connect', {
@@ -320,7 +321,7 @@ export default function App() {
           'Content-Type': 'application/json',
           ...(userToken ? { 'Authorization': `Bearer ${userToken}` } : {})
         },
-        body: JSON.stringify({ exchangeId, apiKey, apiSecret, isTestnet, apiPassphrase }),
+        body: JSON.stringify({ exchangeId, apiKey, apiSecret, isTestnet, apiPassphrase, positionMode }),
       });
       if (res.status === 401) {
         handleLogout();

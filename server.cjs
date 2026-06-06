@@ -260,6 +260,7 @@ function getOrCreateSession(username) {
       if (decrypted) {
         const creds = JSON.parse(decrypted);
         session.exchangeConfig = creds;
+        session.isHedgeMode = (creds.positionMode === 'HEDGE');
 
         const ccxtExchangeId = creds.exchangeId === 'kucoin' ? 'kucoinfutures' : creds.exchangeId;
         const exchangeClass = getCcxt()[ccxtExchangeId];
@@ -1696,8 +1697,8 @@ app.post('/api/auth/logout', (req, res) => {
 
 app.post('/api/connect', requireAuth, async (req, res) => {
   const session = req.userSession;
-  const { exchangeId, apiKey, apiSecret, apiPassphrase, isTestnet } = req.body;
-  session.addLog(`Attempting to connect to ${exchangeId.toUpperCase()}...`, 'info');
+  const { exchangeId, apiKey, apiSecret, apiPassphrase, positionMode, isTestnet } = req.body;
+  session.addLog(`Attempting to connect to ${exchangeId.toUpperCase()} (${positionMode || 'ONE_WAY'})...`, 'info');
 
   try {
     const ccxtExchangeId = exchangeId === 'kucoin' ? 'kucoinfutures' : exchangeId;
@@ -1733,16 +1734,28 @@ app.post('/api/connect', requireAuth, async (req, res) => {
     // Success: Update session state
     session.exchangeInstance = testExchange;
     session.connectionStatus = 'CONNECTED';
-    session.exchangeConfig = { exchangeId, apiKey, apiSecret, apiPassphrase, isTestnet };
+    session.exchangeConfig = { exchangeId, apiKey, apiSecret, apiPassphrase, positionMode, isTestnet };
+    session.isHedgeMode = (positionMode === 'HEDGE');
     session.circuitBreakerTriggered = false; // Reset circuit breaker on successful connection
     
+    // Attempt to set position mode on exchange
+    try {
+      const isHedge = (positionMode === 'HEDGE');
+      if (testExchange.setPositionMode) {
+        session.addLog(`[Position Mode] Setting position mode on exchange to: ${positionMode}...`, 'info');
+        await testExchange.setPositionMode(isHedge);
+      }
+    } catch (setModeErr) {
+      session.addLog(`[Position Mode] Warning: Exchange position mode switch failed: ${setModeErr.message}`, 'warning');
+    }
+
     // Start WebSocket stream
     initSessionWebSocket(session);
 
     // Write securely to local db file
     const profile = loadUserProfile(session.username);
     if (profile) {
-      const credsString = JSON.stringify({ exchangeId, apiKey, apiSecret, apiPassphrase, isTestnet });
+      const credsString = JSON.stringify({ exchangeId, apiKey, apiSecret, apiPassphrase, positionMode, isTestnet });
       profile.encryptedExchangeConfig = encryptText(credsString);
       saveUserProfile(profile);
     }
@@ -2014,6 +2027,34 @@ async function checkVolatilityAndLiquidity(session, symbol, latestCandle) {
   return { ok: true };
 }
 
+async function enforceExchangePositionMode(session, symbol) {
+  if (!session.exchangeInstance) return;
+  if (!session.exchangeConfig) return;
+  const targetMode = session.exchangeConfig.positionMode || 'ONE_WAY';
+  
+  try {
+    const marketSymbol = getMarketSymbol(session, symbol);
+    let currentMode = await getExchangePositionMode(session, symbol);
+    
+    if (currentMode !== targetMode) {
+      session.addLog(`[Position Mode] Exchange is currently in ${currentMode} mode. Attempting to switch to preferred ${targetMode} mode...`, 'info');
+      try {
+        const isHedge = (targetMode === 'HEDGE');
+        await session.exchangeInstance.setPositionMode(isHedge, marketSymbol);
+        currentMode = await getExchangePositionMode(session, symbol);
+        session.isHedgeMode = (currentMode === 'HEDGE');
+        session.addLog(`[Position Mode] Successfully switched exchange to ${currentMode} mode.`, 'success');
+      } catch (switchErr) {
+        session.addLog(`[Position Mode] Switch failed: ${switchErr.message}`, 'warning');
+      }
+    } else {
+      session.isHedgeMode = (currentMode === 'HEDGE');
+    }
+  } catch (err) {
+    console.error(`Failed to enforce position mode:`, err.message);
+  }
+}
+
 async function verifyHedgeMode(session, symbol) {
   if (!session.exchangeInstance) return true; // mock mode
   try {
@@ -2275,7 +2316,21 @@ setInterval(async () => {
                 openStops = await callExchange(session, 'fetchOpenOrders', undefined, undefined, undefined, { stop: true });
                 session.cachedOpenStops = openStops;
               } catch (stopErr) {
-                console.error(`Failed to fetch Kucoin open stop orders for ${session.username}:`, stopErr.message);
+                console.error(`Failed to fetch Kucoin open stop orders globally for ${session.username}:`, stopErr.message);
+                // Fallback: fetch for each active symbol and concatenate
+                openStops = [];
+                for (const activeSym of symbolsToProcess) {
+                  try {
+                    const mSym = getMarketSymbol(session, activeSym);
+                    const symStops = await callExchange(session, 'fetchOpenOrders', mSym, undefined, undefined, { stop: true });
+                    if (Array.isArray(symStops)) {
+                      openStops = openStops.concat(symStops);
+                    }
+                  } catch (symStopErr) {
+                    console.error(`Failed to fetch Kucoin open stop orders for ${activeSym}:`, symStopErr.message);
+                  }
+                }
+                session.cachedOpenStops = openStops;
               }
             }
             
@@ -3125,10 +3180,9 @@ setInterval(async () => {
             // Standard single execution
             const tradeSide = decision.signal === 'BUY' ? 'buy' : 'sell';
             
-            // 1. Query the exchange's current position mode dynamically before placing order
-            const activeMode = await getExchangePositionMode(session, symbol);
-            session.isHedgeMode = (activeMode === 'HEDGE');
-            session.addLog(`[ENTRY DIAGNOSTIC] Symbol: ${symbol} | Active Position Mode: ${activeMode} | Signal: ${decision.signal}`, 'info');
+            // 1. Enforce preferred position mode on the exchange dynamically before placing order
+            await enforceExchangePositionMode(session, symbol);
+            session.addLog(`[ENTRY DIAGNOSTIC] Symbol: ${symbol} | Active Position Mode: ${session.isHedgeMode ? 'HEDGE' : 'ONE_WAY'} | Signal: ${decision.signal}`, 'info');
 
             const entryParams = session.isHedgeMode ? { positionIdx: decision.signal === 'BUY' ? 1 : 2 } : { positionIdx: 0 };
             
