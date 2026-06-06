@@ -213,6 +213,7 @@ function getOrCreateSession(username) {
     cachedPositionsMap: {},
     positionsLastFetched: 0,
     forceRefreshExchangeData: false,
+    exchangePositionModeChecked: false,
     stratSettings: profile.stratSettings || {
       strategyType: 'TREND_FOLLOWING',
       emaShortPeriod: 20,
@@ -261,6 +262,7 @@ function getOrCreateSession(username) {
         const creds = JSON.parse(decrypted);
         session.exchangeConfig = creds;
         session.isHedgeMode = (creds.positionMode === 'HEDGE');
+        session.exchangePositionModeChecked = false;
 
         const ccxtExchangeId = creds.exchangeId === 'kucoin' ? 'kucoinfutures' : creds.exchangeId;
         const exchangeClass = getCcxt()[ccxtExchangeId];
@@ -356,17 +358,40 @@ async function getExchangePositionMode(session, symbol) {
   try {
     const marketSymbol = getMarketSymbol(session, symbol);
     await session.exchangeInstance.loadMarkets();
+
+    // 1. Check if direct fetchPositionMode exists (e.g. KuCoin, Binance)
+    if (session.exchangeInstance.has['fetchPositionMode']) {
+      try {
+        const modeInfo = await session.exchangeInstance.fetchPositionMode(marketSymbol);
+        if (modeInfo && modeInfo.hedged !== undefined) {
+          return modeInfo.hedged ? 'HEDGE' : 'ONE_WAY';
+        }
+      } catch (modeErr) {
+        session.addLog(`Direct position mode check via fetchPositionMode failed: ${modeErr.message}`, 'warning');
+      }
+    }
+
+    // 2. Fallback to positions array analysis
     const positions = await session.exchangeInstance.fetchPositions([marketSymbol]);
     if (positions && positions.length > 0) {
       let foundHedge = false;
       let foundOneWay = false;
       for (const p of positions) {
         const rawIdx = p.positionIdx !== undefined ? p.positionIdx : (p.info ? (p.info.positionIdx || p.info.position_idx) : undefined);
+        const posSide = p.info ? (p.info.posSide || p.info.positionSide || p.info.position_side || p.info.side) : undefined;
+        
         if (rawIdx !== undefined) {
           const pIdx = parseInt(rawIdx);
           if (pIdx === 1 || pIdx === 2) {
             foundHedge = true;
           } else if (pIdx === 0) {
+            foundOneWay = true;
+          }
+        } else if (posSide !== undefined) {
+          const sideLower = posSide.toLowerCase();
+          if (sideLower === 'long' || sideLower === 'short') {
+            foundHedge = true;
+          } else if (sideLower === 'both' || sideLower === 'net' || sideLower === '') {
             foundOneWay = true;
           }
         }
@@ -1803,6 +1828,7 @@ app.post('/api/connect', requireAuth, async (req, res) => {
     session.connectionStatus = 'CONNECTED';
     session.exchangeConfig = { exchangeId, apiKey, apiSecret, apiPassphrase, positionMode, isTestnet };
     session.isHedgeMode = (positionMode === 'HEDGE');
+    session.exchangePositionModeChecked = false;
     session.circuitBreakerTriggered = false; // Reset circuit breaker on successful connection
     
     // Attempt to set position mode on exchange
@@ -1863,6 +1889,7 @@ app.post('/api/disconnect', requireAuth, (req, res) => {
   session.connectionStatus = 'DISCONNECTED';
   session.exchangeConfig = { exchangeId: 'binance', apiKey: '', apiSecret: '', isTestnet: true };
   session.botActive = false;
+  session.exchangePositionModeChecked = false;
   
   const profile = loadUserProfile(session.username);
   if (profile) {
@@ -2097,6 +2124,11 @@ async function checkVolatilityAndLiquidity(session, symbol, latestCandle) {
 async function enforceExchangePositionMode(session, symbol) {
   if (!session.exchangeInstance) return;
   if (!session.exchangeConfig) return;
+  
+  if (session.exchangePositionModeChecked) {
+    return;
+  }
+  
   const targetMode = session.exchangeConfig.positionMode || 'ONE_WAY';
   
   try {
@@ -2111,11 +2143,15 @@ async function enforceExchangePositionMode(session, symbol) {
         currentMode = await getExchangePositionMode(session, symbol);
         session.isHedgeMode = (currentMode === 'HEDGE');
         session.addLog(`[Position Mode] Successfully switched exchange to ${currentMode} mode.`, 'success');
+        session.exchangePositionModeChecked = true;
       } catch (switchErr) {
         session.addLog(`[Position Mode] Switch failed: ${switchErr.message}`, 'warning');
+        // Set checked to true to prevent repeating a failed switch attempt on every single tick
+        session.exchangePositionModeChecked = true;
       }
     } else {
       session.isHedgeMode = (currentMode === 'HEDGE');
+      session.exchangePositionModeChecked = true;
     }
   } catch (err) {
     console.error(`Failed to enforce position mode:`, err.message);
