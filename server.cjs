@@ -334,7 +334,7 @@ setTimeout(initAllActiveSessions, 1000);
 function getMarketSymbol(session, symbol) {
   let target = symbol;
   
-  if (target === 'MATIC/USDT' && session.exchangeConfig?.exchangeId === 'bybit') {
+  if (target === 'MATIC/USDT') {
     target = 'POL/USDT';
   }
   
@@ -969,6 +969,10 @@ async function safeCreateMarketOrder(session, symbol, side, amount, params = {},
       delete cleanParams.posSide;
     }
     delete cleanParams.positionIdx;
+    
+    // Strip stopLoss and takeProfit to avoid KuCoin Futures margin mode mismatch (error 330005)
+    delete cleanParams.stopLoss;
+    delete cleanParams.takeProfit;
   } else if (exchangeId === 'kraken') {
     delete cleanParams.positionIdx;
   }
