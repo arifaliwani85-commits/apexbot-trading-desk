@@ -341,6 +341,10 @@ function getMarketSymbol(session, symbol) {
   if (target === 'MATIC/USDT') {
     target = 'POL/USDT';
   }
+
+  if (target.endsWith(':USDT')) {
+    return target;
+  }
   
   if (session.exchangeInstance) {
     const swapSymbol = `${target}:USDT`;
@@ -699,7 +703,7 @@ async function setExchangeStopLossTakeProfit(session, symbol, positionIdx, stopL
           marginMode: marginMode
         };
         if (session.isHedgeMode) {
-          slParams.posSide = posType === 'LONG' ? 'long' : 'short';
+          slParams.positionSide = posType === 'LONG' ? 'LONG' : 'SHORT';
         }
         
         await callExchange(session, 'createOrder', marketSymbol, 'market', sideToClose, posSize, undefined, slParams);
@@ -717,7 +721,7 @@ async function setExchangeStopLossTakeProfit(session, symbol, positionIdx, stopL
           marginMode: marginMode
         };
         if (session.isHedgeMode) {
-          tpParams.posSide = posType === 'LONG' ? 'long' : 'short';
+          tpParams.positionSide = posType === 'LONG' ? 'LONG' : 'SHORT';
         }
         
         await callExchange(session, 'createOrder', marketSymbol, 'market', sideToClose, posSize, undefined, tpParams);
@@ -1017,11 +1021,11 @@ async function safeCreateMarketOrder(session, symbol, side, amount, params = {},
     delete cleanParams.positionIdx;
   } else if (exchangeId === 'kucoin') {
     if (params.positionIdx === 1) {
-      cleanParams.posSide = 'long';
+      cleanParams.positionSide = 'LONG';
     } else if (params.positionIdx === 2) {
-      cleanParams.posSide = 'short';
+      cleanParams.positionSide = 'SHORT';
     } else {
-      delete cleanParams.posSide;
+      delete cleanParams.positionSide;
     }
     delete cleanParams.positionIdx;
     
