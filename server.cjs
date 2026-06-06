@@ -215,6 +215,7 @@ function getOrCreateSession(username) {
     forceRefreshExchangeData: false,
     exchangePositionModeChecked: false,
     exchangeMarginModes: {},
+    exchangeMarginModesChecked: {},
     stratSettings: profile.stratSettings || {
       strategyType: 'TREND_FOLLOWING',
       emaShortPeriod: 20,
@@ -265,6 +266,7 @@ function getOrCreateSession(username) {
         session.isHedgeMode = (creds.positionMode === 'HEDGE');
         session.exchangePositionModeChecked = false;
         session.exchangeMarginModes = {};
+        session.exchangeMarginModesChecked = {};
 
         const ccxtExchangeId = creds.exchangeId === 'kucoin' ? 'kucoinfutures' : creds.exchangeId;
         const exchangeClass = getCcxt()[ccxtExchangeId];
@@ -412,27 +414,37 @@ async function getExchangePositionMode(session, symbol) {
 }
 
 async function getExchangeMarginMode(session, symbol) {
-  if (!session.exchangeInstance) return 'CROSS';
-  if (session.exchangeConfig?.exchangeId !== 'kucoin') return 'CROSS';
-  
-  const cacheKey = symbol;
-  session.exchangeMarginModes = session.exchangeMarginModes || {};
-  if (session.exchangeMarginModes[cacheKey]) {
-    return session.exchangeMarginModes[cacheKey];
-  }
+  return 'ISOLATED';
+}
 
+async function enforceExchangeMarginMode(session, symbol) {
+  if (!session.exchangeInstance) return;
+  
+  session.exchangeMarginModesChecked = session.exchangeMarginModesChecked || {};
+  if (session.exchangeMarginModesChecked[symbol]) {
+    return;
+  }
+  
+  const marketSymbol = getMarketSymbol(session, symbol);
+  session.addLog(`[Margin Mode] Enforcing ISOLATED margin mode for ${symbol}...`, 'info');
+  
   try {
-    const marketSymbol = getMarketSymbol(session, symbol);
-    const modeRes = await callExchange(session, 'fetchMarginMode', marketSymbol);
-    if (modeRes && modeRes.marginMode) {
-      const mode = modeRes.marginMode.toUpperCase(); // 'ISOLATED' or 'CROSS'
-      session.exchangeMarginModes[cacheKey] = mode;
-      return mode;
+    if (session.exchangeInstance.has['setMarginMode']) {
+      await session.exchangeInstance.setMarginMode('isolated', marketSymbol);
+      session.addLog(`[Margin Mode] Successfully set margin mode to ISOLATED for ${symbol}.`, 'success');
+      session.exchangeMarginModesChecked[symbol] = true;
     }
   } catch (err) {
-    session.addLog(`Failed to fetch margin mode for ${symbol}: ${err.message}`, 'warning');
+    const msg = err.message || '';
+    if (msg.includes('already') || msg.includes('No modification') || msg.includes('not modified') || msg.includes('330006') || msg.includes('330005')) {
+      session.addLog(`[Margin Mode] Margin mode for ${symbol} is already ISOLATED.`, 'success');
+      session.exchangeMarginModesChecked[symbol] = true;
+    } else {
+      session.addLog(`[Margin Mode] Warning: Failed to set margin mode to ISOLATED for ${symbol}: ${err.message}`, 'warning');
+      // Still set it to true to avoid spamming the exchange on every single signal evaluation
+      session.exchangeMarginModesChecked[symbol] = true;
+    }
   }
-  return 'CROSS';
 }
 
 async function callExchange(session, method, ...args) {
@@ -1873,6 +1885,7 @@ app.post('/api/connect', requireAuth, async (req, res) => {
     session.isHedgeMode = (positionMode === 'HEDGE');
     session.exchangePositionModeChecked = false;
     session.exchangeMarginModes = {};
+    session.exchangeMarginModesChecked = {};
     session.circuitBreakerTriggered = false; // Reset circuit breaker on successful connection
     
     // Attempt to set position mode on exchange
@@ -1935,6 +1948,7 @@ app.post('/api/disconnect', requireAuth, (req, res) => {
   session.botActive = false;
   session.exchangePositionModeChecked = false;
   session.exchangeMarginModes = {};
+  session.exchangeMarginModesChecked = {};
   
   const profile = loadUserProfile(session.username);
   if (profile) {
@@ -3162,6 +3176,9 @@ setInterval(async () => {
               }
             }
 
+            // Enforce Isolated Margin Mode dynamically before placing order
+            await enforceExchangeMarginMode(session, symbol);
+
             session.addLog(`Sending simultaneous Hedged Dual entries to Exchange for ${symbol} (Primary Size: ${sizePrimary.toFixed(4)}, Hedge Size: ${sizeHedge.toFixed(4)})...`, 'info');
 
             let primaryOrder = null;
@@ -3330,6 +3347,10 @@ setInterval(async () => {
             
             // 1. Enforce preferred position mode on the exchange dynamically before placing order
             await enforceExchangePositionMode(session, symbol);
+            
+            // 2. Enforce Isolated Margin Mode dynamically before placing order
+            await enforceExchangeMarginMode(session, symbol);
+
             session.addLog(`[ENTRY DIAGNOSTIC] Symbol: ${symbol} | Active Position Mode: ${session.isHedgeMode ? 'HEDGE' : 'ONE_WAY'} | Signal: ${decision.signal}`, 'info');
 
             const entryParams = session.isHedgeMode ? { positionIdx: decision.signal === 'BUY' ? 1 : 2 } : { positionIdx: 0 };
