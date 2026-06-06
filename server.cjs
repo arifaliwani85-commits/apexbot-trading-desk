@@ -333,24 +333,25 @@ setTimeout(initAllActiveSessions, 1000);
 // --- Exchange & Sizing & Logging Helpers ---
 function getMarketSymbol(session, symbol) {
   let target = symbol;
-  // Map MATIC to POL on Bybit (since Bybit completed MATIC -> POL migration)
-  if (session.exchangeInstance && session.exchangeConfig.exchangeId === 'bybit') {
-    if (target === 'MATIC/USDT') {
-      target = 'POL/USDT';
-    }
+  
+  if (target === 'MATIC/USDT' && session.exchangeConfig?.exchangeId === 'bybit') {
+    target = 'POL/USDT';
+  }
+  
+  if (session.exchangeInstance) {
     const swapSymbol = `${target}:USDT`;
     if (session.exchangeInstance.markets && session.exchangeInstance.markets[swapSymbol]) {
       return swapSymbol;
     }
-    return swapSymbol; // Fallback to swap format directly if markets not loaded yet
+    const exId = session.exchangeConfig?.exchangeId;
+    if (exId === 'bybit' || exId === 'kucoin' || exId === 'binance' || exId === 'okx') {
+      return swapSymbol;
+    }
   }
   return target;
 }
 
 async function getExchangePositionMode(session, symbol) {
-  if (session.exchangeConfig && session.exchangeConfig.exchangeId === 'kucoin') {
-    return 'ONE_WAY';
-  }
   if (!session.exchangeInstance) return session.isHedgeMode ? 'HEDGE' : 'ONE_WAY'; // mock mode
   try {
     const marketSymbol = getMarketSymbol(session, symbol);
@@ -602,13 +603,28 @@ async function setExchangeStopLossTakeProfit(session, symbol, positionIdx, stopL
 
       // 2. Fetch active position details to know size and sideToClose
       const positions = await callExchange(session, 'fetchPositions', [marketSymbol]);
-      const activePos = positions.find(p => p.contracts > 0 || Math.abs(parseFloat(p.info?.currentQty || 0)) > 0);
+      const activePos = positions.find(p => {
+        const contracts = parseFloat(p.contracts !== undefined ? p.contracts : (p.info?.currentQty || 0));
+        if (Math.abs(contracts) <= 0) return false;
+        
+        // Match positionIdx
+        const side = p.side ? p.side.toUpperCase() : '';
+        const isLong = (side === 'LONG' || side === 'BUY' || contracts > 0);
+        
+        if (positionIdx === 1) {
+          return isLong;
+        } else if (positionIdx === 2) {
+          return !isLong;
+        }
+        return true;
+      });
+      
       if (!activePos) {
-        session.addLog(`[Kucoin Protection] No active position found to attach protection for ${symbol}.`, 'warning');
+        session.addLog(`[Kucoin Protection] No active position found (idx: ${positionIdx}) to attach protection for ${symbol}.`, 'warning');
         return false;
       }
 
-      const posSize = Math.abs(parseInt(activePos.contracts !== undefined ? activePos.contracts : (activePos.info?.currentQty || 0)));
+      const posSize = Math.abs(parseFloat(activePos.contracts !== undefined ? activePos.contracts : (activePos.info?.currentQty || 0)));
       const posQty = parseFloat(activePos.contracts !== undefined ? activePos.contracts : (activePos.info?.currentQty || 0));
       const posType = posQty > 0 ? 'LONG' : 'SHORT';
       const sideToClose = posType === 'LONG' ? 'sell' : 'buy';
@@ -622,22 +638,34 @@ async function setExchangeStopLossTakeProfit(session, symbol, positionIdx, stopL
       if (stopLoss) {
         const slPriceFormatted = parseFloat(session.exchangeInstance.priceToPrecision(marketSymbol, parseFloat(stopLoss)));
         session.addLog(`[Kucoin Protection] Placing Stop Loss trigger order at $${slPriceFormatted} (Contracts: ${posSize})...`, 'info');
-        await callExchange(session, 'createOrder', marketSymbol, 'market', sideToClose, posSize, undefined, {
+        
+        const slParams = {
           stopLossPrice: slPriceFormatted,
           stopPriceType: 'TP',
           reduceOnly: true
-        });
+        };
+        if (session.isHedgeMode) {
+          slParams.posSide = posType === 'LONG' ? 'long' : 'short';
+        }
+        
+        await callExchange(session, 'createOrder', marketSymbol, 'market', sideToClose, posSize, undefined, slParams);
       }
 
       // 4. Attach Take Profit stop order
       if (takeProfit) {
         const tpPriceFormatted = parseFloat(session.exchangeInstance.priceToPrecision(marketSymbol, parseFloat(takeProfit)));
         session.addLog(`[Kucoin Protection] Placing Take Profit trigger order at $${tpPriceFormatted} (Contracts: ${posSize})...`, 'info');
-        await callExchange(session, 'createOrder', marketSymbol, 'market', sideToClose, posSize, undefined, {
+        
+        const tpParams = {
           takeProfitPrice: tpPriceFormatted,
           stopPriceType: 'TP',
           reduceOnly: true
-        });
+        };
+        if (session.isHedgeMode) {
+          tpParams.posSide = posType === 'LONG' ? 'long' : 'short';
+        }
+        
+        await callExchange(session, 'createOrder', marketSymbol, 'market', sideToClose, posSize, undefined, tpParams);
       }
 
       session.addLog(`[Kucoin Protection] Successfully set Stop Loss ($${stopLoss || 'N/A'}) and Take Profit ($${takeProfit || 'N/A'}) for ${symbol}.`, 'success');
@@ -910,11 +938,46 @@ async function safeCreateMarketOrder(session, symbol, side, amount, params = {},
   const posModeLabel = isHedge ? 'HEDGE MODE' : 'ONE-WAY MODE';
   addLog(`[ORDER PLACEMENT DIAGNOSTIC] Position Mode: ${posModeLabel} | positionIdx: ${params.positionIdx !== undefined ? params.positionIdx : 'N/A'} | Symbol: ${symbol} | Side: ${side.toUpperCase()} | Amount: ${amount} | Payload: ${JSON.stringify(params)}`, 'info');
 
+  // Map positionIdx parameter to exchange-specific fields
+  const cleanParams = { ...params };
+  const exchangeId = session.exchangeConfig?.exchangeId;
+  
+  if (exchangeId === 'binance') {
+    if (params.positionIdx === 1) {
+      cleanParams.positionSide = 'LONG';
+    } else if (params.positionIdx === 2) {
+      cleanParams.positionSide = 'SHORT';
+    } else if (params.positionIdx === 0) {
+      cleanParams.positionSide = 'BOTH';
+    }
+    delete cleanParams.positionIdx;
+  } else if (exchangeId === 'okx') {
+    if (params.positionIdx === 1) {
+      cleanParams.posSide = 'long';
+    } else if (params.positionIdx === 2) {
+      cleanParams.posSide = 'short';
+    } else if (params.positionIdx === 0) {
+      cleanParams.posSide = 'net';
+    }
+    delete cleanParams.positionIdx;
+  } else if (exchangeId === 'kucoin') {
+    if (params.positionIdx === 1) {
+      cleanParams.posSide = 'long';
+    } else if (params.positionIdx === 2) {
+      cleanParams.posSide = 'short';
+    } else {
+      delete cleanParams.posSide;
+    }
+    delete cleanParams.positionIdx;
+  } else if (exchangeId === 'kraken') {
+    delete cleanParams.positionIdx;
+  }
+
   for (let i = 1; i <= attempts; i++) {
     try {
-      addLog(`Sending Market Order to Exchange (Attempt ${i}/${attempts}): ${side.toUpperCase()} ${amount} ${symbol} (params: ${JSON.stringify(params)})`, 'info');
+      addLog(`Sending Market Order to Exchange (Attempt ${i}/${attempts}): ${side.toUpperCase()} ${amount} ${symbol} (params: ${JSON.stringify(cleanParams)})`, 'info');
       const order = session.exchangeInstance 
-        ? await callExchange(session, 'createMarketOrder', symbol, side, amount, undefined, params)
+        ? await callExchange(session, 'createMarketOrder', symbol, side, amount, undefined, cleanParams)
         : { price: session.lastTickPrices[symbol] || 1.0, average: session.lastTickPrices[symbol] || 1.0, amount };
       return order;
     } catch (err) {

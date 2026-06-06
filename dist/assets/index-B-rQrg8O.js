@@ -11814,7 +11814,7 @@ var StrategyConfig = ({ stratSettings, setStratSettings, riskSettings, setRiskSe
 	};
 	const handleExchangeChange = (id) => {
 		setExchangeId(id);
-		if (id === "kucoin" || id === "kraken") setPositionMode("ONE_WAY");
+		if (id === "kraken") setPositionMode("ONE_WAY");
 	};
 	const handleStrategyChange = (e) => {
 		setStratSettings((prev) => ({
@@ -12231,7 +12231,7 @@ var StrategyConfig = ({ stratSettings, setStratSettings, riskSettings, setRiskSe
 								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
 									value: "ONE_WAY",
 									children: "One-Way Mode"
-								}), (exchangeId === "binance" || exchangeId === "bybit" || exchangeId === "okx") && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+								}), (exchangeId === "binance" || exchangeId === "bybit" || exchangeId === "okx" || exchangeId === "kucoin") && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
 									value: "HEDGE",
 									children: "Hedge Mode (Dual)"
 								})]
@@ -13353,9 +13353,9 @@ var TradeLogs = ({ activePosition, closedTrades, logs, onClosePosition, latestPr
 						alignItems: "center",
 						gap: "6px"
 					},
-					children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+					children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
 						style: { color: "var(--text-secondary)" },
-						children: "Bybit API:"
+						children: [exchangeStatus?.exchangeId ? exchangeStatus.exchangeId.toUpperCase() : "Exchange", " API:"]
 					}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
 						className: "badge",
 						style: {

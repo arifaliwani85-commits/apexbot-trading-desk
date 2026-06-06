@@ -149,7 +149,9 @@ export const TradeLogs: React.FC<TradeLogsProps> = ({
         )}
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-            <span style={{ color: 'var(--text-secondary)' }}>Bybit API:</span>
+            <span style={{ color: 'var(--text-secondary)' }}>
+              {exchangeStatus?.exchangeId ? exchangeStatus.exchangeId.toUpperCase() : 'Exchange'} API:
+            </span>
             <span className="badge" style={{ 
               background: wsConnected ? 'rgba(2, 192, 118, 0.15)' : 'rgba(246, 70, 93, 0.15)', 
               color: wsConnected ? 'var(--accent-green)' : 'var(--accent-red)',

@@ -89,7 +89,7 @@ export const StrategyConfig: React.FC<StrategyConfigProps> = ({
 
   const handleExchangeChange = (id: string) => {
     setExchangeId(id);
-    if (id === 'kucoin' || id === 'kraken') {
+    if (id === 'kraken') {
       setPositionMode('ONE_WAY');
     }
   };
@@ -346,7 +346,7 @@ export const StrategyConfig: React.FC<StrategyConfigProps> = ({
                 <label className="form-label">Position Mode</label>
                 <select className="select-input" value={positionMode} onChange={(e) => setPositionMode(e.target.value)}>
                   <option value="ONE_WAY">One-Way Mode</option>
-                  {(exchangeId === 'binance' || exchangeId === 'bybit' || exchangeId === 'okx') && (
+                  {(exchangeId === 'binance' || exchangeId === 'bybit' || exchangeId === 'okx' || exchangeId === 'kucoin') && (
                     <option value="HEDGE">Hedge Mode (Dual)</option>
                   )}
                 </select>
