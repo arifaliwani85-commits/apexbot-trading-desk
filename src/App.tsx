@@ -111,6 +111,12 @@ export default function App() {
     circuitBreakerTriggered?: boolean;
     maskedApiKey?: string;
     maskedApiSecret?: string;
+    isHedgeMode?: boolean;
+    rpm?: number;
+    rateLimitRemaining?: number;
+    lastRateLimitEvent?: number | null;
+    scanPaused?: boolean;
+    wsConnected?: boolean;
   }>({
     connected: false,
     exchangeId: 'binance',
@@ -121,6 +127,12 @@ export default function App() {
     circuitBreakerTriggered: false,
     maskedApiKey: '',
     maskedApiSecret: '',
+    isHedgeMode: false,
+    rpm: 0,
+    rateLimitRemaining: 1000,
+    lastRateLimitEvent: null,
+    scanPaused: false,
+    wsConnected: false,
   });
   const [symbol, setSymbol] = useState('BTC/USDT, ETH/USDT, SOL/USDT, DOGE/USDT, ALGO/USDT, ADA/USDT, XRP/USDT, LTC/USDT, LINK/USDT, DOT/USDT, AVAX/USDT, BNB/USDT, NEAR/USDT, MATIC/USDT, UNI/USDT, SUI/USDT, APT/USDT');
   const [viewedSymbol, setViewedSymbol] = useState('BTC/USDT');
@@ -212,6 +224,12 @@ export default function App() {
             circuitBreakerTriggered: data.circuitBreakerTriggered,
             maskedApiKey: data.maskedApiKey,
             maskedApiSecret: data.maskedApiSecret,
+            isHedgeMode: data.isHedgeMode,
+            rpm: data.rpm,
+            rateLimitRemaining: data.rateLimitRemaining,
+            lastRateLimitEvent: data.lastRateLimitEvent,
+            scanPaused: data.scanPaused,
+            wsConnected: data.wsConnected,
           });
           setBotActive(data.botActive);
           setAllPositions(data.allPositions || []);
@@ -292,7 +310,8 @@ export default function App() {
     exchangeId: string,
     apiKey: string,
     apiSecret: string,
-    isTestnet: boolean
+    isTestnet: boolean,
+    apiPassphrase?: string
   ): Promise<boolean> => {
     try {
       const res = await fetch('/api/connect', {
@@ -301,7 +320,7 @@ export default function App() {
           'Content-Type': 'application/json',
           ...(userToken ? { 'Authorization': `Bearer ${userToken}` } : {})
         },
-        body: JSON.stringify({ exchangeId, apiKey, apiSecret, isTestnet }),
+        body: JSON.stringify({ exchangeId, apiKey, apiSecret, isTestnet, apiPassphrase }),
       });
       if (res.status === 401) {
         handleLogout();
@@ -1100,6 +1119,7 @@ export default function App() {
                 allPositions={currentAllPositions}
                 evaluationStates={evaluationStates}
                 accountBalance={account.balance}
+                exchangeStatus={exchangeStatus}
               />
             </div>
           </div>

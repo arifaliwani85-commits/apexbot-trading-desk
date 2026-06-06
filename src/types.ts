@@ -49,6 +49,11 @@ export interface Position {
   hedgedScenario?: 'A' | 'B' | 'C' | 'NONE';
   pairedPositionId?: string;
   maxLeveragedPnL?: number;
+  tpStatus?: 'ATTACHED' | 'MISSING' | 'PENDING';
+  slStatus?: 'ATTACHED' | 'MISSING' | 'PENDING';
+  tsStatus?: 'ATTACHED' | 'MISSING' | 'DISABLED';
+  protectionWarning?: string | null;
+  protectionMissingSince?: number | null;
 }
 
 export type StrategyType = 'TREND_FOLLOWING' | 'MEAN_REVERSION' | 'MOMENTUM_BREAKOUT' | 'HIGH_FREQUENCY_SCALPER' | 'NEWS_SENTIMENT_TRADING';

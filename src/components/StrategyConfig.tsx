@@ -34,8 +34,9 @@ interface StrategyConfigProps {
     circuitBreakerTriggered?: boolean;
     maskedApiKey?: string;
     maskedApiSecret?: string;
+    isHedgeMode?: boolean;
   };
-  onConnectExchange: (exchangeId: string, apiKey: string, apiSecret: string, isTestnet: boolean) => Promise<boolean>;
+  onConnectExchange: (exchangeId: string, apiKey: string, apiSecret: string, isTestnet: boolean, apiPassphrase?: string) => Promise<boolean>;
   onDisconnectExchange: () => void;
   symbol: string;
   setSymbol: (s: string) => void;
@@ -63,6 +64,7 @@ export const StrategyConfig: React.FC<StrategyConfigProps> = ({
   const [exchangeId, setExchangeId] = useState('binance');
   const [apiKey, setApiKey] = useState('');
   const [apiSecret, setApiSecret] = useState('');
+  const [apiPassphrase, setApiPassphrase] = useState('');
   const [isTestnet, setIsTestnet] = useState(true);
   const [connecting, setConnecting] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
@@ -117,13 +119,18 @@ export const StrategyConfig: React.FC<StrategyConfigProps> = ({
       setErrorMessage('API Key and Secret are required.');
       return;
     }
+    if (exchangeId === 'kucoin' && !apiPassphrase) {
+      setErrorMessage('API Passphrase is required for KuCoin.');
+      return;
+    }
     setErrorMessage('');
     setConnecting(true);
     try {
-      const ok = await onConnectExchange(exchangeId, apiKey, apiSecret, isTestnet);
+      const ok = await onConnectExchange(exchangeId, apiKey, apiSecret, isTestnet, apiPassphrase);
       if (ok) {
         setApiKey('');
         setApiSecret('');
+        setApiPassphrase('');
       } else {
         setErrorMessage('Failed to connect. Check exchange details or api key permission.');
       }
@@ -241,6 +248,12 @@ export const StrategyConfig: React.FC<StrategyConfigProps> = ({
                 <span style={{ color: 'var(--text-secondary)' }}>Environment:</span>
                 <span>{exchangeStatus.isTestnet ? 'Testnet paper trading' : 'Mainnet Real Trading'}</span>
               </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
+                <span style={{ color: 'var(--text-secondary)' }}>Position Mode:</span>
+                <span style={{ fontWeight: 'bold', color: 'var(--accent-gold)' }}>
+                  {exchangeStatus.isHedgeMode ? 'HEDGE MODE (Dual)' : 'ONE-WAY MODE'}
+                </span>
+              </div>
               <div style={{ display: 'flex', justifyContent: 'space-between', borderTop: '1px solid var(--border-color)', paddingTop: '8px', marginTop: '8px' }}>
                 <span style={{ color: 'var(--text-secondary)' }}>Account Balance:</span>
                 <span style={{ fontFamily: 'var(--font-mono)', fontWeight: 'bold', color: 'var(--accent-green)' }}>
@@ -316,6 +329,7 @@ export const StrategyConfig: React.FC<StrategyConfigProps> = ({
                   <option value="bybit">Bybit</option>
                   <option value="okx">OKX</option>
                   <option value="kraken">Kraken</option>
+                  <option value="kucoin">KuCoin</option>
                 </select>
               </div>
 
@@ -340,6 +354,19 @@ export const StrategyConfig: React.FC<StrategyConfigProps> = ({
                   onChange={(e) => setApiSecret(e.target.value)}
                 />
               </div>
+
+              {exchangeId === 'kucoin' && (
+                <div className="form-group" style={{ marginBottom: '8px' }}>
+                  <label className="form-label">API Passphrase</label>
+                  <input
+                    type="password"
+                    className="text-input"
+                    placeholder="Enter KuCoin API Passphrase"
+                    value={apiPassphrase}
+                    onChange={(e) => setApiPassphrase(e.target.value)}
+                  />
+                </div>
+              )}
 
               <div className="switch-group" style={{ marginBottom: '8px' }}>
                 <span className="switch-label" style={{ cursor: 'pointer' }} onClick={() => setIsTestnet(!isTestnet)}>Use Testnet Sandbox</span>

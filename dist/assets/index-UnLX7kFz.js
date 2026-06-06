@@ -11794,6 +11794,7 @@ var StrategyConfig = ({ stratSettings, setStratSettings, riskSettings, setRiskSe
 	const [exchangeId, setExchangeId] = (0, import_react.useState)("binance");
 	const [apiKey, setApiKey] = (0, import_react.useState)("");
 	const [apiSecret, setApiSecret] = (0, import_react.useState)("");
+	const [apiPassphrase, setApiPassphrase] = (0, import_react.useState)("");
 	const [isTestnet, setIsTestnet] = (0, import_react.useState)(true);
 	const [connecting, setConnecting] = (0, import_react.useState)(false);
 	const [errorMessage, setErrorMessage] = (0, import_react.useState)("");
@@ -11839,12 +11840,17 @@ var StrategyConfig = ({ stratSettings, setStratSettings, riskSettings, setRiskSe
 			setErrorMessage("API Key and Secret are required.");
 			return;
 		}
+		if (exchangeId === "kucoin" && !apiPassphrase) {
+			setErrorMessage("API Passphrase is required for KuCoin.");
+			return;
+		}
 		setErrorMessage("");
 		setConnecting(true);
 		try {
-			if (await onConnectExchange(exchangeId, apiKey, apiSecret, isTestnet)) {
+			if (await onConnectExchange(exchangeId, apiKey, apiSecret, isTestnet, apiPassphrase)) {
 				setApiKey("");
 				setApiSecret("");
+				setApiPassphrase("");
 			} else setErrorMessage("Failed to connect. Check exchange details or api key permission.");
 		} catch (err) {
 			setErrorMessage(err.message || "Connection failed.");
@@ -12024,6 +12030,23 @@ var StrategyConfig = ({ stratSettings, setStratSettings, riskSettings, setRiskSe
 							style: {
 								display: "flex",
 								justifyContent: "space-between",
+								marginBottom: "8px"
+							},
+							children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+								style: { color: "var(--text-secondary)" },
+								children: "Position Mode:"
+							}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+								style: {
+									fontWeight: "bold",
+									color: "var(--accent-gold)"
+								},
+								children: exchangeStatus.isHedgeMode ? "HEDGE MODE (Dual)" : "ONE-WAY MODE"
+							})]
+						}),
+						/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+							style: {
+								display: "flex",
+								justifyContent: "space-between",
 								borderTop: "1px solid var(--border-color)",
 								paddingTop: "8px",
 								marginTop: "8px"
@@ -12181,6 +12204,10 @@ var StrategyConfig = ({ stratSettings, setStratSettings, riskSettings, setRiskSe
 									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
 										value: "kraken",
 										children: "Kraken"
+									}),
+									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+										value: "kucoin",
+										children: "KuCoin"
 									})
 								]
 							})]
@@ -12211,6 +12238,20 @@ var StrategyConfig = ({ stratSettings, setStratSettings, riskSettings, setRiskSe
 								placeholder: "Paste API Secret",
 								value: apiSecret,
 								onChange: (e) => setApiSecret(e.target.value)
+							})]
+						}),
+						exchangeId === "kucoin" && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+							className: "form-group",
+							style: { marginBottom: "8px" },
+							children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("label", {
+								className: "form-label",
+								children: "API Passphrase"
+							}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+								type: "password",
+								className: "text-input",
+								placeholder: "Enter KuCoin API Passphrase",
+								value: apiPassphrase,
+								onChange: (e) => setApiPassphrase(e.target.value)
 							})]
 						}),
 						/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
@@ -13131,7 +13172,7 @@ var OrderBook = ({ latestPrice }) => {
 };
 //#endregion
 //#region src/components/TradeLogs.tsx
-var TradeLogs = ({ activePosition, closedTrades, logs, onClosePosition, latestPrice, allPositions = [], evaluationStates = {}, accountBalance = 1e4 }) => {
+var TradeLogs = ({ activePosition, closedTrades, logs, onClosePosition, latestPrice, allPositions = [], evaluationStates = {}, accountBalance = 1e4, exchangeStatus }) => {
 	const [activeTab, setActiveTab] = (0, import_react.useState)("positions");
 	const logEndRef = (0, import_react.useRef)(null);
 	(0, import_react.useEffect)(() => {
@@ -13150,6 +13191,194 @@ var TradeLogs = ({ activePosition, closedTrades, logs, onClosePosition, latestPr
 		};
 	};
 	const livePnl = getLivePnl();
+	const renderProtectionBadges = (pos) => {
+		if (pos.status === "CLOSED") return null;
+		if (!pos.tpStatus) return null;
+		const tp = pos.tpStatus || "MISSING";
+		const sl = pos.slStatus || "MISSING";
+		const ts = pos.tsStatus || "DISABLED";
+		const getBadgeStyle = (status) => {
+			switch (status) {
+				case "ATTACHED": return {
+					background: "rgba(2, 192, 118, 0.15)",
+					color: "var(--accent-green)",
+					border: "1px solid rgba(2, 192, 118, 0.3)"
+				};
+				case "PENDING": return {
+					background: "rgba(240, 185, 11, 0.15)",
+					color: "var(--accent-gold)",
+					border: "1px solid rgba(240, 185, 11, 0.3)"
+				};
+				case "MISSING": return {
+					background: "rgba(246, 70, 93, 0.15)",
+					color: "var(--accent-red)",
+					border: "1px solid rgba(246, 70, 93, 0.3)"
+				};
+				default: return {
+					background: "rgba(156, 163, 175, 0.1)",
+					color: "var(--text-muted)",
+					border: "1px solid rgba(156, 163, 175, 0.2)"
+				};
+			}
+		};
+		return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+			style: {
+				display: "flex",
+				gap: "8px",
+				alignItems: "center",
+				marginTop: "6px"
+			},
+			children: [
+				/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+					style: {
+						fontSize: "10px",
+						color: "var(--text-secondary)"
+					},
+					children: "Protection:"
+				}),
+				/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+					className: "badge",
+					style: {
+						...getBadgeStyle(tp),
+						fontSize: "9px",
+						padding: "2px 6px",
+						borderRadius: "4px"
+					},
+					children: ["TP: ", tp]
+				}),
+				/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+					className: "badge",
+					style: {
+						...getBadgeStyle(sl),
+						fontSize: "9px",
+						padding: "2px 6px",
+						borderRadius: "4px"
+					},
+					children: ["SL: ", sl]
+				}),
+				/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+					className: "badge",
+					style: {
+						...getBadgeStyle(ts),
+						fontSize: "9px",
+						padding: "2px 6px",
+						borderRadius: "4px"
+					},
+					children: ["TS: ", ts]
+				}),
+				pos.protectionWarning && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+					className: "badge pulse-warning",
+					style: {
+						background: "rgba(246, 70, 93, 0.2)",
+						color: "var(--accent-red)",
+						fontSize: "9px",
+						padding: "2px 6px",
+						fontWeight: "bold",
+						marginLeft: "auto",
+						borderRadius: "4px",
+						border: "1px solid var(--accent-red)"
+					},
+					children: ["⚠️ ", pos.protectionWarning]
+				})
+			]
+		});
+	};
+	const renderApiHealthPanel = () => {
+		if (!exchangeStatus || !exchangeStatus.connected) return null;
+		const rpm = exchangeStatus.rpm || 0;
+		const remaining = exchangeStatus.rateLimitRemaining ?? 1e3;
+		const isPaused = exchangeStatus.scanPaused;
+		const wsConnected = exchangeStatus.wsConnected;
+		return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+			style: {
+				display: "flex",
+				flexDirection: "column",
+				gap: "6px",
+				padding: "10px 16px",
+				background: "var(--bg-secondary)",
+				borderBottom: "1px solid var(--border-color)",
+				fontSize: "11px"
+			},
+			children: [isPaused && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+				className: "pulse-warning",
+				style: {
+					background: "rgba(246, 70, 93, 0.15)",
+					border: "1px solid var(--accent-red)",
+					color: "var(--accent-red)",
+					borderRadius: "var(--radius-md)",
+					padding: "6px 10px",
+					fontWeight: "bold",
+					display: "flex",
+					alignItems: "center",
+					gap: "8px",
+					marginBottom: "4px"
+				},
+				children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "⚠️ API RATE LIMIT EXCEEDED - SCANNING TEMPORARILY PAUSED (60S)" })
+			}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+				style: {
+					display: "flex",
+					justifyContent: "space-between",
+					alignItems: "center",
+					flexWrap: "wrap",
+					gap: "8px"
+				},
+				children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+					style: {
+						display: "flex",
+						alignItems: "center",
+						gap: "6px"
+					},
+					children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+						style: { color: "var(--text-secondary)" },
+						children: "Bybit API:"
+					}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+						className: "badge",
+						style: {
+							background: wsConnected ? "rgba(2, 192, 118, 0.15)" : "rgba(246, 70, 93, 0.15)",
+							color: wsConnected ? "var(--accent-green)" : "var(--accent-red)",
+							fontSize: "9px",
+							padding: "1px 5px",
+							borderRadius: "4px"
+						},
+						children: wsConnected ? "WebSocket Active" : "REST Polling"
+					})]
+				}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+					style: {
+						display: "flex",
+						gap: "12px",
+						fontFamily: "var(--font-mono)"
+					},
+					children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
+						/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+							style: { color: "var(--text-secondary)" },
+							children: "RPM:"
+						}),
+						" ",
+						/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+							style: {
+								color: rpm > 50 ? "var(--accent-gold)" : "var(--text-primary)",
+								fontWeight: "bold"
+							},
+							children: rpm
+						})
+					] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
+						/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+							style: { color: "var(--text-secondary)" },
+							children: "Limit Remaining:"
+						}),
+						" ",
+						/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+							style: {
+								color: remaining < 100 ? "var(--accent-red)" : "var(--text-primary)",
+								fontWeight: "bold"
+							},
+							children: remaining
+						})
+					] })]
+				})]
+			})]
+		});
+	};
 	return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 		className: "logs-container",
 		style: {
@@ -13157,179 +13386,933 @@ var TradeLogs = ({ activePosition, closedTrades, logs, onClosePosition, latestPr
 			flexDirection: "column",
 			height: "50%"
 		},
-		children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-			className: "tabs-header",
-			children: [
-				/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
-					className: `tab-btn ${activeTab === "positions" ? "active" : ""}`,
-					onClick: () => setActiveTab("positions"),
-					children: [
-						/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Briefcase, {
+		children: [
+			/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+				className: "tabs-header",
+				children: [
+					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+						className: `tab-btn ${activeTab === "positions" ? "active" : ""}`,
+						onClick: () => setActiveTab("positions"),
+						children: [
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Briefcase, {
+								size: 12,
+								style: {
+									marginRight: "5px",
+									verticalAlign: "middle"
+								}
+							}),
+							"POSITIONS (",
+							allPositions.length > 0 ? allPositions.length : activePosition ? 1 : 0,
+							")"
+						]
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+						className: `tab-btn ${activeTab === "logs" ? "active" : ""}`,
+						onClick: () => setActiveTab("logs"),
+						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Terminal, {
 							size: 12,
 							style: {
 								marginRight: "5px",
 								verticalAlign: "middle"
 							}
-						}),
-						"POSITIONS (",
-						allPositions.length > 0 ? allPositions.length : activePosition ? 1 : 0,
-						")"
-					]
-				}),
-				/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
-					className: `tab-btn ${activeTab === "logs" ? "active" : ""}`,
-					onClick: () => setActiveTab("logs"),
-					children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Terminal, {
-						size: 12,
+						}), "SYSTEM LOGS"]
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+						className: `tab-btn ${activeTab === "history" ? "active" : ""}`,
+						onClick: () => setActiveTab("history"),
+						children: [
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(History, {
+								size: 12,
+								style: {
+									marginRight: "5px",
+									verticalAlign: "middle"
+								}
+							}),
+							"HISTORY (",
+							closedTrades.length,
+							")"
+						]
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+						className: `tab-btn ${activeTab === "diagnostics" ? "active" : ""}`,
+						onClick: () => setActiveTab("diagnostics"),
+						children: [
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Activity, {
+								size: 12,
+								style: {
+									marginRight: "5px",
+									verticalAlign: "middle"
+								}
+							}),
+							"BOT DIAGNOSTICS (",
+							Object.keys(evaluationStates).length,
+							")"
+						]
+					})
+				]
+			}),
+			renderApiHealthPanel(),
+			/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+				style: {
+					flexGrow: 1,
+					overflowY: "auto",
+					minHeight: 0
+				},
+				children: [
+					activeTab === "positions" && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
 						style: {
-							marginRight: "5px",
-							verticalAlign: "middle"
-						}
-					}), "SYSTEM LOGS"]
-				}),
-				/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
-					className: `tab-btn ${activeTab === "history" ? "active" : ""}`,
-					onClick: () => setActiveTab("history"),
-					children: [
-						/* @__PURE__ */ (0, import_jsx_runtime.jsx)(History, {
-							size: 12,
-							style: {
-								marginRight: "5px",
-								verticalAlign: "middle"
-							}
-						}),
-						"HISTORY (",
-						closedTrades.length,
-						")"
-					]
-				}),
-				/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
-					className: `tab-btn ${activeTab === "diagnostics" ? "active" : ""}`,
-					onClick: () => setActiveTab("diagnostics"),
-					children: [
-						/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Activity, {
-							size: 12,
-							style: {
-								marginRight: "5px",
-								verticalAlign: "middle"
-							}
-						}),
-						"BOT DIAGNOSTICS (",
-						Object.keys(evaluationStates).length,
-						")"
-					]
-				})
-			]
-		}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-			style: {
-				flexGrow: 1,
-				overflowY: "auto",
-				minHeight: 0
-			},
-			children: [
-				activeTab === "positions" && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-					style: {
-						padding: "16px",
-						height: "100%",
-						display: "flex",
-						flexDirection: "column",
-						overflowY: "auto"
-					},
-					children: allPositions.length > 0 ? (() => {
-						const groups = [];
-						const processedIds = /* @__PURE__ */ new Set();
-						allPositions.forEach((pos) => {
-							if (processedIds.has(pos.id)) return;
-							if (pos.isHedgedPair) {
-								if (pos.hedgedRole === "PRIMARY") {
-									const pairedHedge = allPositions.find((p) => p.id === pos.pairedPositionId);
+							padding: "16px",
+							height: "100%",
+							display: "flex",
+							flexDirection: "column",
+							overflowY: "auto"
+						},
+						children: allPositions.length > 0 ? (() => {
+							const groups = [];
+							const processedIds = /* @__PURE__ */ new Set();
+							allPositions.forEach((pos) => {
+								if (processedIds.has(pos.id)) return;
+								if (pos.isHedgedPair) {
+									if (pos.hedgedRole === "PRIMARY") {
+										const pairedHedge = allPositions.find((p) => p.id === pos.pairedPositionId);
+										groups.push({
+											symbol: pos.symbol,
+											primary: pos,
+											hedge: pairedHedge
+										});
+										processedIds.add(pos.id);
+										if (pairedHedge) processedIds.add(pairedHedge.id);
+									} else if (!allPositions.find((p) => p.id === pos.pairedPositionId)) {
+										groups.push({
+											symbol: pos.symbol,
+											hedge: pos
+										});
+										processedIds.add(pos.id);
+									}
+								} else {
 									groups.push({
 										symbol: pos.symbol,
-										primary: pos,
-										hedge: pairedHedge
-									});
-									processedIds.add(pos.id);
-									if (pairedHedge) processedIds.add(pairedHedge.id);
-								} else if (!allPositions.find((p) => p.id === pos.pairedPositionId)) {
-									groups.push({
-										symbol: pos.symbol,
-										hedge: pos
+										single: pos
 									});
 									processedIds.add(pos.id);
 								}
-							} else {
-								groups.push({
-									symbol: pos.symbol,
-									single: pos
-								});
-								processedIds.add(pos.id);
-							}
-						});
-						return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+							});
+							return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+								style: {
+									display: "flex",
+									flexDirection: "column",
+									gap: "14px"
+								},
+								children: groups.map((group, idx) => {
+									let primaryPnlVal = 0;
+									let primaryPct = 0;
+									let hedgePnlVal = 0;
+									let hedgePct = 0;
+									let singlePnlVal = 0;
+									let singlePct = 0;
+									let groupUnrealizedPnl = 0;
+									let groupRealizedPnl = 0;
+									if (group.single) {
+										const curPrice = group.single.symbol === activePosition?.symbol ? latestPrice : group.single.entryPrice;
+										singlePnlVal = (group.single.type === "LONG" ? curPrice - group.single.entryPrice : group.single.entryPrice - curPrice) * group.single.size * group.single.leverage;
+										singlePct = singlePnlVal / (group.single.entryPrice * group.single.size) * 100;
+										groupUnrealizedPnl += singlePnlVal;
+									}
+									if (group.primary) {
+										const curPrice = group.primary.symbol === activePosition?.symbol ? latestPrice : group.primary.entryPrice;
+										primaryPnlVal = (group.primary.type === "LONG" ? curPrice - group.primary.entryPrice : group.primary.entryPrice - curPrice) * group.primary.size * group.primary.leverage;
+										primaryPct = primaryPnlVal / (group.primary.entryPrice * group.primary.size) * 100;
+										groupUnrealizedPnl += primaryPnlVal;
+									} else if (group.hedge) {
+										const cp = closedTrades.find((t) => t.id === group.hedge?.pairedPositionId);
+										if (cp) {
+											primaryPnlVal = cp.pnl;
+											primaryPct = cp.pnlPercent;
+											groupRealizedPnl += cp.pnl;
+										}
+									}
+									if (group.hedge) {
+										const curPrice = group.hedge.symbol === activePosition?.symbol ? latestPrice : group.hedge.entryPrice;
+										hedgePnlVal = (group.hedge.type === "LONG" ? curPrice - group.hedge.entryPrice : group.hedge.entryPrice - curPrice) * group.hedge.size * group.hedge.leverage;
+										hedgePct = hedgePnlVal / (group.hedge.entryPrice * group.hedge.size) * 100;
+										groupUnrealizedPnl += hedgePnlVal;
+									} else if (group.primary) {
+										const ch = closedTrades.find((t) => t.id === group.primary?.pairedPositionId);
+										if (ch) {
+											hedgePnlVal = ch.pnl;
+											hedgePct = ch.pnlPercent;
+											groupRealizedPnl += ch.pnl;
+										}
+									}
+									const combinedPnl = groupRealizedPnl + groupUnrealizedPnl;
+									let hedgeEfficiency = null;
+									if (primaryPnlVal < 0) hedgeEfficiency = hedgePnlVal / Math.abs(primaryPnlVal) * 100;
+									let riskExposure = 0;
+									if (group.single) riskExposure = group.single.size * group.single.entryPrice / accountBalance * 100;
+									if (group.primary) riskExposure += group.primary.size * group.primary.entryPrice / accountBalance * 100;
+									if (group.hedge) riskExposure += group.hedge.size * group.hedge.entryPrice / accountBalance * 100;
+									const activeScenario = group.primary?.hedgedScenario || group.hedge?.hedgedScenario || "NONE";
+									const isHedged = !!(group.primary || group.hedge);
+									return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+										style: {
+											background: "var(--bg-tertiary)",
+											border: "1px solid var(--border-color)",
+											borderRadius: "var(--radius-lg)",
+											padding: "16px",
+											display: "flex",
+											flexDirection: "column",
+											gap: "12px"
+										},
+										children: [
+											/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+												style: {
+													display: "flex",
+													justifyContent: "space-between",
+													alignItems: "center"
+												},
+												children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+													style: {
+														display: "flex",
+														alignItems: "center",
+														gap: "8px"
+													},
+													children: [
+														/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+															style: {
+																fontSize: "15px",
+																fontWeight: "bold",
+																fontFamily: "var(--font-mono)"
+															},
+															children: group.symbol
+														}),
+														isHedged && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+															className: "badge",
+															style: {
+																background: "rgba(37, 99, 235, 0.1)",
+																color: "var(--accent-blue)",
+																fontSize: "9px"
+															},
+															children: "HEDGED PAIR"
+														}),
+														isHedged && activeScenario !== "NONE" && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+															className: "badge",
+															style: {
+																background: "rgba(245, 158, 11, 0.15)",
+																color: "var(--accent-gold)",
+																fontSize: "9px"
+															},
+															children: ["SCENARIO ", activeScenario]
+														})
+													]
+												}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+													onClick: () => onClosePosition(group.symbol),
+													className: "btn btn-secondary",
+													style: {
+														width: "auto",
+														padding: "4px 10px",
+														fontSize: "11px",
+														display: "flex",
+														gap: "4px",
+														alignItems: "center"
+													},
+													children: [
+														/* @__PURE__ */ (0, import_jsx_runtime.jsx)(X, { size: 12 }),
+														" ",
+														isHedged ? "Close Pair" : "Close Trade"
+													]
+												})]
+											}),
+											/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+												style: {
+													display: "flex",
+													flexDirection: "column",
+													gap: "8px"
+												},
+												children: [
+													group.single && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+														style: {
+															display: "flex",
+															flexDirection: "column",
+															gap: "6px",
+															padding: "8px 10px",
+															background: "var(--bg-secondary)",
+															borderRadius: "var(--radius-md)"
+														},
+														children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+															style: {
+																display: "flex",
+																justifyContent: "space-between",
+																alignItems: "center"
+															},
+															children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+																className: `badge ${group.single.type === "LONG" ? "badge-long" : "badge-short"}`,
+																style: {
+																	fontSize: "9px",
+																	marginRight: "6px"
+																},
+																children: [
+																	group.single.type,
+																	" ",
+																	group.single.leverage,
+																	"X"
+																]
+															}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+																style: {
+																	fontSize: "11px",
+																	color: "var(--text-secondary)",
+																	fontFamily: "var(--font-mono)"
+																},
+																children: [
+																	"Entry: $",
+																	group.single.entryPrice.toLocaleString(void 0, { minimumFractionDigits: 2 }),
+																	" | SL: $",
+																	group.single.stopLoss.toLocaleString(),
+																	" | TP: $",
+																	group.single.takeProfit.toLocaleString()
+																]
+															})] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+																className: singlePnlVal >= 0 ? "green-text" : "red-text",
+																style: {
+																	fontFamily: "var(--font-mono)",
+																	fontWeight: "bold",
+																	fontSize: "12px"
+																},
+																children: [
+																	singlePnlVal >= 0 ? "+" : "",
+																	"$",
+																	singlePnlVal.toFixed(2),
+																	" (",
+																	singlePnlVal >= 0 ? "+" : "",
+																	singlePct.toFixed(1),
+																	"%)"
+																]
+															})]
+														}), renderProtectionBadges(group.single)]
+													}),
+													group.primary && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+														style: {
+															display: "flex",
+															flexDirection: "column",
+															gap: "6px",
+															padding: "8px 10px",
+															background: "var(--bg-secondary)",
+															borderRadius: "var(--radius-md)",
+															borderLeft: "3px solid var(--accent-blue)"
+														},
+														children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+															style: {
+																display: "flex",
+																justifyContent: "space-between",
+																alignItems: "center"
+															},
+															children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
+																/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+																	className: "badge",
+																	style: {
+																		background: "rgba(37, 99, 235, 0.15)",
+																		color: "var(--accent-blue)",
+																		fontSize: "8px",
+																		padding: "1px 3px",
+																		marginRight: "6px"
+																	},
+																	children: "PRIMARY"
+																}),
+																/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+																	className: `badge ${group.primary.type === "LONG" ? "badge-long" : "badge-short"}`,
+																	style: {
+																		fontSize: "9px",
+																		marginRight: "6px"
+																	},
+																	children: [
+																		group.primary.type,
+																		" ",
+																		group.primary.leverage,
+																		"X"
+																	]
+																}),
+																/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+																	style: {
+																		fontSize: "11px",
+																		color: "var(--text-secondary)",
+																		fontFamily: "var(--font-mono)"
+																	},
+																	children: [
+																		"Entry: $",
+																		group.primary.entryPrice.toLocaleString(void 0, { minimumFractionDigits: 2 }),
+																		" | SL: $",
+																		group.primary.stopLoss.toLocaleString(),
+																		" | TP: $",
+																		group.primary.takeProfit.toLocaleString()
+																	]
+																})
+															] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+																className: primaryPnlVal >= 0 ? "green-text" : "red-text",
+																style: {
+																	fontFamily: "var(--font-mono)",
+																	fontWeight: "bold",
+																	fontSize: "12px"
+																},
+																children: [
+																	primaryPnlVal >= 0 ? "+" : "",
+																	"$",
+																	primaryPnlVal.toFixed(2),
+																	" (",
+																	primaryPnlVal >= 0 ? "+" : "",
+																	primaryPct.toFixed(1),
+																	"%)"
+																]
+															})]
+														}), renderProtectionBadges(group.primary)]
+													}),
+													!group.primary && isHedged && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+														style: {
+															display: "flex",
+															justifyContent: "space-between",
+															alignItems: "center",
+															padding: "8px 10px",
+															background: "var(--bg-secondary)",
+															borderRadius: "var(--radius-md)",
+															borderLeft: "3px solid var(--border-color)",
+															opacity: .6
+														},
+														children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+															className: "badge",
+															style: {
+																background: "var(--border-color)",
+																color: "var(--text-secondary)",
+																fontSize: "8px",
+																padding: "1px 3px",
+																marginRight: "6px"
+															},
+															children: "PRIMARY"
+														}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+															className: "badge",
+															style: {
+																background: "var(--border-color)",
+																color: "var(--text-secondary)",
+																fontSize: "9px",
+																marginRight: "6px"
+															},
+															children: "CLOSED"
+														})] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+															className: primaryPnlVal >= 0 ? "green-text" : "red-text",
+															style: {
+																fontFamily: "var(--font-mono)",
+																fontWeight: "bold",
+																fontSize: "12px"
+															},
+															children: [
+																"Realized: ",
+																primaryPnlVal >= 0 ? "+" : "",
+																"$",
+																primaryPnlVal.toFixed(2)
+															]
+														})]
+													}),
+													group.hedge && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+														style: {
+															display: "flex",
+															flexDirection: "column",
+															gap: "6px",
+															padding: "8px 10px",
+															background: "var(--bg-secondary)",
+															borderRadius: "var(--radius-md)",
+															borderLeft: "3px solid var(--accent-gold)"
+														},
+														children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+															style: {
+																display: "flex",
+																justifyContent: "space-between",
+																alignItems: "center"
+															},
+															children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
+																/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+																	className: "badge",
+																	style: {
+																		background: "rgba(245, 158, 11, 0.15)",
+																		color: "var(--accent-gold)",
+																		fontSize: "8px",
+																		padding: "1px 3px",
+																		marginRight: "6px"
+																	},
+																	children: "HEDGE"
+																}),
+																/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+																	className: `badge ${group.hedge.type === "LONG" ? "badge-long" : "badge-short"}`,
+																	style: {
+																		fontSize: "9px",
+																		marginRight: "6px"
+																	},
+																	children: [
+																		group.hedge.type,
+																		" ",
+																		group.hedge.leverage,
+																		"X"
+																	]
+																}),
+																/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+																	style: {
+																		fontSize: "11px",
+																		color: "var(--text-secondary)",
+																		fontFamily: "var(--font-mono)"
+																	},
+																	children: [
+																		"Entry: $",
+																		group.hedge.entryPrice.toLocaleString(void 0, { minimumFractionDigits: 2 }),
+																		" | SL: $",
+																		group.hedge.stopLoss.toLocaleString(),
+																		" | TP: $",
+																		group.hedge.takeProfit.toLocaleString()
+																	]
+																})
+															] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+																className: hedgePnlVal >= 0 ? "green-text" : "red-text",
+																style: {
+																	fontFamily: "var(--font-mono)",
+																	fontWeight: "bold",
+																	fontSize: "12px"
+																},
+																children: [
+																	hedgePnlVal >= 0 ? "+" : "",
+																	"$",
+																	hedgePnlVal.toFixed(2),
+																	" (",
+																	hedgePnlVal >= 0 ? "+" : "",
+																	hedgePct.toFixed(1),
+																	"%)"
+																]
+															})]
+														}), renderProtectionBadges(group.hedge)]
+													}),
+													!group.hedge && isHedged && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+														style: {
+															display: "flex",
+															justifyContent: "space-between",
+															alignItems: "center",
+															padding: "8px 10px",
+															background: "var(--bg-secondary)",
+															borderRadius: "var(--radius-md)",
+															borderLeft: "3px solid var(--border-color)",
+															opacity: .6
+														},
+														children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+															className: "badge",
+															style: {
+																background: "var(--border-color)",
+																color: "var(--text-secondary)",
+																fontSize: "8px",
+																padding: "1px 3px",
+																marginRight: "6px"
+															},
+															children: "HEDGE"
+														}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+															className: "badge",
+															style: {
+																background: "var(--border-color)",
+																color: "var(--text-secondary)",
+																fontSize: "9px",
+																marginRight: "6px"
+															},
+															children: "CLOSED"
+														})] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+															className: hedgePnlVal >= 0 ? "green-text" : "red-text",
+															style: {
+																fontFamily: "var(--font-mono)",
+																fontWeight: "bold",
+																fontSize: "12px"
+															},
+															children: [
+																"Realized: ",
+																hedgePnlVal >= 0 ? "+" : "",
+																"$",
+																hedgePnlVal.toFixed(2)
+															]
+														})]
+													})
+												]
+											}),
+											/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+												style: {
+													borderTop: "1px solid var(--border-color)",
+													paddingTop: "10px",
+													display: "grid",
+													gridTemplateColumns: isHedged ? "repeat(4, 1fr)" : "repeat(2, 1fr)",
+													gap: "8px",
+													textAlign: "center",
+													fontSize: "11px"
+												},
+												children: [
+													/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+														style: {
+															color: "var(--text-secondary)",
+															fontSize: "9px",
+															textTransform: "uppercase"
+														},
+														children: "Combined PnL"
+													}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+														className: combinedPnl >= 0 ? "green-text" : "red-text",
+														style: {
+															fontFamily: "var(--font-mono)",
+															fontWeight: "bold"
+														},
+														children: [
+															combinedPnl >= 0 ? "+" : "",
+															"$",
+															combinedPnl.toFixed(2)
+														]
+													})] }),
+													isHedged && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(import_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+														style: {
+															color: "var(--text-secondary)",
+															fontSize: "9px",
+															textTransform: "uppercase"
+														},
+														children: "Realized PnL"
+													}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+														style: {
+															fontFamily: "var(--font-mono)",
+															fontWeight: "bold",
+															color: groupRealizedPnl >= 0 ? "var(--accent-green)" : "var(--accent-red)"
+														},
+														children: ["$", groupRealizedPnl.toFixed(2)]
+													})] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+														style: {
+															color: "var(--text-secondary)",
+															fontSize: "9px",
+															textTransform: "uppercase"
+														},
+														children: "Hedge Efficiency"
+													}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+														style: {
+															fontFamily: "var(--font-mono)",
+															fontWeight: "bold",
+															color: "var(--text-primary)"
+														},
+														children: hedgeEfficiency !== null ? `${hedgeEfficiency.toFixed(1)}%` : "N/A"
+													})] })] }),
+													/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+														style: {
+															color: "var(--text-secondary)",
+															fontSize: "9px",
+															textTransform: "uppercase"
+														},
+														children: "Risk Exposure"
+													}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+														style: {
+															fontFamily: "var(--font-mono)",
+															fontWeight: "bold",
+															color: riskExposure > 100 ? "var(--accent-red)" : "var(--text-primary)"
+														},
+														children: [riskExposure.toFixed(1), "%"]
+													})] })
+												]
+											})
+										]
+									}, idx);
+								})
+							});
+						})() : activePosition ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+							style: {
+								background: "var(--bg-tertiary)",
+								border: "1px solid var(--border-color)",
+								borderRadius: "var(--radius-lg)",
+								padding: "16px",
+								position: "relative"
+							},
+							children: [
+								/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+									style: {
+										display: "flex",
+										justifyContent: "space-between",
+										marginBottom: "12px"
+									},
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+										className: `badge ${activePosition.type === "LONG" ? "badge-long" : "badge-short"}`,
+										children: [
+											activePosition.type,
+											" ",
+											activePosition.leverage,
+											"X"
+										]
+									}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+										onClick: () => onClosePosition(),
+										className: "btn btn-secondary",
+										style: {
+											width: "auto",
+											padding: "4px 8px",
+											fontSize: "11px",
+											display: "flex",
+											gap: "4px",
+											alignItems: "center"
+										},
+										title: "Market Close Position",
+										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(X, { size: 12 }), " Close"]
+									})]
+								}),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+									style: {
+										display: "grid",
+										gridTemplateColumns: "1fr 1fr",
+										gap: "12px 24px",
+										fontSize: "12px",
+										fontFamily: "var(--font-mono)"
+									},
+									children: [
+										/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+											style: {
+												color: "var(--text-secondary)",
+												fontSize: "10px"
+											},
+											children: "ENTRY PRICE"
+										}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: ["$", activePosition.entryPrice.toLocaleString(void 0, { minimumFractionDigits: 2 })] })] }),
+										/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+											style: {
+												color: "var(--text-secondary)",
+												fontSize: "10px"
+											},
+											children: "CURRENT PRICE"
+										}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: ["$", latestPrice.toLocaleString(void 0, { minimumFractionDigits: 2 })] })] }),
+										/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+											style: {
+												color: "var(--text-secondary)",
+												fontSize: "10px"
+											},
+											children: "STOP LOSS (SL)"
+										}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+											className: "red-text",
+											children: ["$", activePosition.stopLoss.toLocaleString(void 0, { minimumFractionDigits: 2 })]
+										})] }),
+										/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+											style: {
+												color: "var(--text-secondary)",
+												fontSize: "10px"
+											},
+											children: "TAKE PROFIT (TP)"
+										}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+											className: "green-text",
+											children: ["$", activePosition.takeProfit.toLocaleString(void 0, { minimumFractionDigits: 2 })]
+										})] }),
+										/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+											style: {
+												color: "var(--text-secondary)",
+												fontSize: "10px"
+											},
+											children: "POSITION SIZE"
+										}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [activePosition.size.toFixed(4), " MOCK"] })] }),
+										/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+											style: {
+												color: "var(--text-secondary)",
+												fontSize: "10px"
+											},
+											children: "TOTAL VALUE"
+										}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: ["$", (activePosition.size * activePosition.entryPrice).toFixed(2)] })] })
+									]
+								}),
+								renderProtectionBadges(activePosition),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+									style: {
+										marginTop: "12px",
+										paddingTop: "12px",
+										borderTop: "1px solid var(--border-color)",
+										display: "flex",
+										justifyContent: "space-between",
+										alignItems: "center"
+									},
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+										style: {
+											fontSize: "13px",
+											fontWeight: "600"
+										},
+										children: "Unrealized PnL"
+									}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+										className: livePnl.usd >= 0 ? "green-text" : "red-text",
+										style: {
+											fontFamily: "var(--font-mono)",
+											fontWeight: "bold",
+											fontSize: "16px"
+										},
+										children: [
+											livePnl.usd >= 0 ? "+" : "",
+											"$",
+											livePnl.usd.toFixed(2),
+											" (",
+											livePnl.usd >= 0 ? "+" : "",
+											livePnl.percent.toFixed(2),
+											"%)"
+										]
+									})]
+								})
+							]
+						}) : /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 							style: {
 								display: "flex",
 								flexDirection: "column",
-								gap: "14px"
+								alignItems: "center",
+								justifyContent: "center",
+								height: "100%",
+								color: "var(--text-muted)",
+								fontSize: "13px"
 							},
-							children: groups.map((group, idx) => {
-								let primaryPnlVal = 0;
-								let primaryPct = 0;
-								let hedgePnlVal = 0;
-								let hedgePct = 0;
-								let singlePnlVal = 0;
-								let singlePct = 0;
-								let groupUnrealizedPnl = 0;
-								let groupRealizedPnl = 0;
-								if (group.single) {
-									const curPrice = group.single.symbol === activePosition?.symbol ? latestPrice : group.single.entryPrice;
-									singlePnlVal = (group.single.type === "LONG" ? curPrice - group.single.entryPrice : group.single.entryPrice - curPrice) * group.single.size * group.single.leverage;
-									singlePct = singlePnlVal / (group.single.entryPrice * group.single.size) * 100;
-									groupUnrealizedPnl += singlePnlVal;
+							children: ["No active positions.", /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+								style: {
+									fontSize: "11px",
+									marginTop: "6px",
+									textAlign: "center",
+									maxWidth: "80%"
+								},
+								children: "Enable the bot simulation to automatically execute setups when indicators align."
+							})]
+						})
+					}),
+					activeTab === "logs" && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "log-list",
+						children: [logs.map((log) => {
+							const d = new Date(log.timestamp);
+							const timeStr = `${d.getHours().toString().padStart(2, "0")}:${d.getMinutes().toString().padStart(2, "0")}:${d.getSeconds().toString().padStart(2, "0")}`;
+							return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+								className: `log-item ${log.type}`,
+								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+									className: "log-time",
+									children: [
+										"[",
+										timeStr,
+										"]"
+									]
+								}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: log.text })]
+							}, log.id);
+						}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { ref: logEndRef })]
+					}),
+					activeTab === "history" && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+						style: {
+							height: "100%",
+							overflowY: "auto"
+						},
+						children: closedTrades.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("table", {
+							className: "trade-table",
+							style: { width: "100%" },
+							children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("thead", { children: /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("tr", { children: [
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", { children: "Type" }),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", { children: "Entry" }),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", { children: "Exit" }),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", { children: "Result (PnL)" }),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", { children: "Reason" })
+							] }) }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("tbody", { children: [...closedTrades].reverse().map((trade) => /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("tr", { children: [
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("td", { children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+									className: `badge ${trade.type === "LONG" ? "badge-long" : "badge-short"}`,
+									children: trade.type
+								}) }),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("td", { children: ["$", trade.entryPrice.toFixed(2)] }),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("td", { children: ["$", trade.exitPrice?.toFixed(2)] }),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("td", {
+									className: trade.pnl >= 0 ? "green-text" : "red-text",
+									children: [
+										trade.pnl >= 0 ? "+" : "",
+										"$",
+										trade.pnl.toFixed(2),
+										" (",
+										trade.pnlPercent.toFixed(2),
+										"%)"
+									]
+								}),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("td", {
+									style: {
+										fontSize: "10px",
+										color: "var(--text-secondary)"
+									},
+									children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+										className: `badge`,
+										style: {
+											backgroundColor: trade.exitReason === "TP" ? "var(--accent-green-bg)" : trade.exitReason === "SL" ? "var(--accent-red-bg)" : "var(--bg-tertiary)",
+											color: trade.exitReason === "TP" ? "var(--accent-green)" : trade.exitReason === "SL" ? "var(--accent-red)" : "var(--text-secondary)"
+										},
+										children: trade.exitReason
+									})
+								})
+							] }, trade.id)) })]
+						}) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+							style: {
+								display: "flex",
+								alignItems: "center",
+								justifyContent: "center",
+								height: "100%",
+								color: "var(--text-muted)",
+								fontSize: "13px"
+							},
+							children: "No trade history yet."
+						})
+					}),
+					activeTab === "diagnostics" && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+						style: {
+							padding: "16px",
+							height: "100%",
+							overflowY: "auto"
+						},
+						children: Object.keys(evaluationStates).length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+							style: {
+								display: "flex",
+								flexDirection: "column",
+								alignItems: "center",
+								justifyContent: "center",
+								height: "100%",
+								color: "var(--text-muted)"
+							},
+							children: ["No diagnostics data received.", /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+								style: {
+									fontSize: "11px",
+									marginTop: "6px",
+									textAlign: "center"
+								},
+								children: "Wait for the bot background loop to execute (ticking every 10 seconds)."
+							})]
+						}) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+							style: {
+								display: "grid",
+								gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))",
+								gap: "12px"
+							},
+							children: Object.keys(evaluationStates).map((symbol) => {
+								const evalState = evaluationStates[symbol];
+								if (!evalState) return null;
+								const rsi = parseFloat(evalState.rsi);
+								const adx = parseFloat(evalState.adx);
+								const isRsiOverbought = rsi >= 70;
+								const isRsiOversold = rsi <= 30;
+								const isAdxTrending = adx >= 25;
+								let badgeClass = "badge-secondary";
+								let statusColor = "var(--text-secondary)";
+								if (evalState.status === "POSITION_OPEN" || evalState.status === "EXECUTING") {
+									badgeClass = "badge-long";
+									statusColor = "var(--accent-green)";
+								} else if (evalState.status === "WAITING_FOR_SIGNAL") {
+									badgeClass = "badge-blue";
+									statusColor = "var(--accent-blue)";
+								} else if (evalState.status === "REJECTED" || evalState.status === "ERROR") {
+									badgeClass = "badge-short";
+									statusColor = "var(--accent-red)";
+								} else if (evalState.status === "COOLDOWN") {
+									badgeClass = "badge-gold";
+									statusColor = "var(--accent-gold)";
 								}
-								if (group.primary) {
-									const curPrice = group.primary.symbol === activePosition?.symbol ? latestPrice : group.primary.entryPrice;
-									primaryPnlVal = (group.primary.type === "LONG" ? curPrice - group.primary.entryPrice : group.primary.entryPrice - curPrice) * group.primary.size * group.primary.leverage;
-									primaryPct = primaryPnlVal / (group.primary.entryPrice * group.primary.size) * 100;
-									groupUnrealizedPnl += primaryPnlVal;
-								} else if (group.hedge) {
-									const cp = closedTrades.find((t) => t.id === group.hedge?.pairedPositionId);
-									if (cp) {
-										primaryPnlVal = cp.pnl;
-										primaryPct = cp.pnlPercent;
-										groupRealizedPnl += cp.pnl;
-									}
-								}
-								if (group.hedge) {
-									const curPrice = group.hedge.symbol === activePosition?.symbol ? latestPrice : group.hedge.entryPrice;
-									hedgePnlVal = (group.hedge.type === "LONG" ? curPrice - group.hedge.entryPrice : group.hedge.entryPrice - curPrice) * group.hedge.size * group.hedge.leverage;
-									hedgePct = hedgePnlVal / (group.hedge.entryPrice * group.hedge.size) * 100;
-									groupUnrealizedPnl += hedgePnlVal;
-								} else if (group.primary) {
-									const ch = closedTrades.find((t) => t.id === group.primary?.pairedPositionId);
-									if (ch) {
-										hedgePnlVal = ch.pnl;
-										hedgePct = ch.pnlPercent;
-										groupRealizedPnl += ch.pnl;
-									}
-								}
-								const combinedPnl = groupRealizedPnl + groupUnrealizedPnl;
-								let hedgeEfficiency = null;
-								if (primaryPnlVal < 0) hedgeEfficiency = hedgePnlVal / Math.abs(primaryPnlVal) * 100;
-								let riskExposure = 0;
-								if (group.single) riskExposure = group.single.size * group.single.entryPrice / accountBalance * 100;
-								if (group.primary) riskExposure += group.primary.size * group.primary.entryPrice / accountBalance * 100;
-								if (group.hedge) riskExposure += group.hedge.size * group.hedge.entryPrice / accountBalance * 100;
-								const activeScenario = group.primary?.hedgedScenario || group.hedge?.hedgedScenario || "NONE";
-								const isHedged = !!(group.primary || group.hedge);
 								return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 									style: {
 										background: "var(--bg-tertiary)",
 										border: "1px solid var(--border-color)",
-										borderRadius: "var(--radius-lg)",
-										padding: "16px",
+										borderRadius: "var(--radius-md)",
+										padding: "12px",
 										display: "flex",
 										flexDirection: "column",
-										gap: "12px"
+										gap: "8px",
+										boxShadow: "0 2px 8px rgba(0, 0, 0, 0.05)",
+										transition: "all 0.2s",
+										cursor: "default"
+									},
+									onMouseEnter: (e) => {
+										e.currentTarget.style.borderColor = statusColor;
+										e.currentTarget.style.boxShadow = `0 0 10px ${statusColor}1A`;
+									},
+									onMouseLeave: (e) => {
+										e.currentTarget.style.borderColor = "var(--border-color)";
+										e.currentTarget.style.boxShadow = "0 2px 8px rgba(0, 0, 0, 0.05)";
 									},
 									children: [
 										/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
@@ -13338,892 +14321,164 @@ var TradeLogs = ({ activePosition, closedTrades, logs, onClosePosition, latestPr
 												justifyContent: "space-between",
 												alignItems: "center"
 											},
-											children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+											children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
 												style: {
-													display: "flex",
-													alignItems: "center",
-													gap: "8px"
+													fontWeight: "bold",
+													fontFamily: "var(--font-mono)",
+													fontSize: "13px"
 												},
-												children: [
-													/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-														style: {
-															fontSize: "15px",
-															fontWeight: "bold",
-															fontFamily: "var(--font-mono)"
-														},
-														children: group.symbol
-													}),
-													isHedged && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-														className: "badge",
-														style: {
-															background: "rgba(37, 99, 235, 0.1)",
-															color: "var(--accent-blue)",
-															fontSize: "9px"
-														},
-														children: "HEDGED PAIR"
-													}),
-													isHedged && activeScenario !== "NONE" && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
-														className: "badge",
-														style: {
-															background: "rgba(245, 158, 11, 0.15)",
-															color: "var(--accent-gold)",
-															fontSize: "9px"
-														},
-														children: ["SCENARIO ", activeScenario]
-													})
-												]
-											}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
-												onClick: () => onClosePosition(group.symbol),
-												className: "btn btn-secondary",
+												children: symbol
+											}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+												className: `badge ${badgeClass}`,
 												style: {
-													width: "auto",
-													padding: "4px 10px",
-													fontSize: "11px",
-													display: "flex",
-													gap: "4px",
-													alignItems: "center"
+													fontSize: "9px",
+													padding: "2px 6px",
+													fontWeight: "bold",
+													letterSpacing: "0.5px",
+													...evalState.status === "WAITING_FOR_SIGNAL" ? {
+														backgroundColor: "rgba(59, 130, 246, 0.1)",
+														color: "#3b82f6",
+														border: "1px solid rgba(59, 130, 246, 0.2)"
+													} : {},
+													...evalState.status === "COOLDOWN" ? {
+														backgroundColor: "rgba(245, 158, 11, 0.1)",
+														color: "#f59e0b",
+														border: "1px solid rgba(245, 158, 11, 0.2)"
+													} : {}
 												},
-												children: [
-													/* @__PURE__ */ (0, import_jsx_runtime.jsx)(X, { size: 12 }),
-													" ",
-													isHedged ? "Close Pair" : "Close Trade"
-												]
+												children: evalState.status
 											})]
 										}),
 										/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 											style: {
-												display: "flex",
-												flexDirection: "column",
-												gap: "8px"
+												fontSize: "11px",
+												color: "var(--text-secondary)",
+												lineHeight: "1.4"
 											},
 											children: [
-												group.single && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", { children: "Decision:" }),
+												" ",
+												evalState.reason
+											]
+										}),
+										/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+											style: {
+												display: "grid",
+												gridTemplateColumns: "1fr 1fr",
+												gap: "6px",
+												fontSize: "10px",
+												fontFamily: "var(--font-mono)",
+												borderTop: "1px solid var(--border-color)",
+												paddingTop: "8px",
+												marginTop: "4px"
+											},
+											children: [
+												/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+													style: { color: "var(--text-muted)" },
+													children: "RSI: "
+												}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
 													style: {
-														display: "flex",
-														justifyContent: "space-between",
-														alignItems: "center",
-														padding: "8px 10px",
-														background: "var(--bg-secondary)",
-														borderRadius: "var(--radius-md)"
+														fontWeight: "bold",
+														color: isRsiOverbought ? "var(--accent-red)" : isRsiOversold ? "var(--accent-green)" : "var(--text-primary)"
 													},
-													children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
-														className: `badge ${group.single.type === "LONG" ? "badge-long" : "badge-short"}`,
-														style: {
-															fontSize: "9px",
-															marginRight: "6px"
-														},
-														children: [
-															group.single.type,
-															" ",
-															group.single.leverage,
-															"X"
-														]
-													}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
-														style: {
-															fontSize: "11px",
-															color: "var(--text-secondary)",
-															fontFamily: "var(--font-mono)"
-														},
-														children: [
-															"Entry: $",
-															group.single.entryPrice.toLocaleString(void 0, { minimumFractionDigits: 2 }),
-															" | SL: $",
-															group.single.stopLoss.toLocaleString(),
-															" | TP: $",
-															group.single.takeProfit.toLocaleString()
-														]
-													})] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
-														className: singlePnlVal >= 0 ? "green-text" : "red-text",
-														style: {
-															fontFamily: "var(--font-mono)",
-															fontWeight: "bold",
-															fontSize: "12px"
-														},
-														children: [
-															singlePnlVal >= 0 ? "+" : "",
-															"$",
-															singlePnlVal.toFixed(2),
-															" (",
-															singlePnlVal >= 0 ? "+" : "",
-															singlePct.toFixed(1),
-															"%)"
-														]
-													})]
-												}),
-												group.primary && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+													children: isNaN(rsi) ? "N/A" : rsi.toFixed(1)
+												})] }),
+												/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+													style: { color: "var(--text-muted)" },
+													children: "ADX: "
+												}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
 													style: {
-														display: "flex",
-														justifyContent: "space-between",
-														alignItems: "center",
-														padding: "8px 10px",
-														background: "var(--bg-secondary)",
-														borderRadius: "var(--radius-md)",
-														borderLeft: "3px solid var(--accent-blue)"
+														fontWeight: "bold",
+														color: isAdxTrending ? "var(--accent-green)" : "var(--text-muted)"
 													},
-													children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
-														/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-															className: "badge",
-															style: {
-																background: "rgba(37, 99, 235, 0.15)",
-																color: "var(--accent-blue)",
-																fontSize: "8px",
-																padding: "1px 3px",
-																marginRight: "6px"
-															},
-															children: "PRIMARY"
-														}),
-														/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
-															className: `badge ${group.primary.type === "LONG" ? "badge-long" : "badge-short"}`,
-															style: {
-																fontSize: "9px",
-																marginRight: "6px"
-															},
-															children: [
-																group.primary.type,
-																" ",
-																group.primary.leverage,
-																"X"
-															]
-														}),
-														/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
-															style: {
-																fontSize: "11px",
-																color: "var(--text-secondary)",
-																fontFamily: "var(--font-mono)"
-															},
-															children: [
-																"Entry: $",
-																group.primary.entryPrice.toLocaleString(void 0, { minimumFractionDigits: 2 }),
-																" | SL: $",
-																group.primary.stopLoss.toLocaleString(),
-																" | TP: $",
-																group.primary.takeProfit.toLocaleString()
-															]
-														})
-													] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
-														className: primaryPnlVal >= 0 ? "green-text" : "red-text",
-														style: {
-															fontFamily: "var(--font-mono)",
-															fontWeight: "bold",
-															fontSize: "12px"
-														},
-														children: [
-															primaryPnlVal >= 0 ? "+" : "",
-															"$",
-															primaryPnlVal.toFixed(2),
-															" (",
-															primaryPnlVal >= 0 ? "+" : "",
-															primaryPct.toFixed(1),
-															"%)"
-														]
-													})]
-												}),
-												!group.primary && isHedged && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-													style: {
-														display: "flex",
-														justifyContent: "space-between",
-														alignItems: "center",
-														padding: "8px 10px",
-														background: "var(--bg-secondary)",
-														borderRadius: "var(--radius-md)",
-														borderLeft: "3px solid var(--border-color)",
-														opacity: .6
-													},
-													children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-														className: "badge",
-														style: {
-															background: "var(--border-color)",
-															color: "var(--text-secondary)",
-															fontSize: "8px",
-															padding: "1px 3px",
-															marginRight: "6px"
-														},
-														children: "PRIMARY"
+													children: isNaN(adx) ? "N/A" : adx.toFixed(1)
+												})] }),
+												/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+													style: { gridColumn: "span 2" },
+													children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+														style: { color: "var(--text-muted)" },
+														children: "EMA: "
 													}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-														className: "badge",
 														style: {
-															background: "var(--border-color)",
-															color: "var(--text-secondary)",
-															fontSize: "9px",
-															marginRight: "6px"
+															color: "var(--text-primary)",
+															fontWeight: "bold"
 														},
-														children: "CLOSED"
-													})] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
-														className: primaryPnlVal >= 0 ? "green-text" : "red-text",
-														style: {
-															fontFamily: "var(--font-mono)",
-															fontWeight: "bold",
-															fontSize: "12px"
-														},
-														children: [
-															"Realized: ",
-															primaryPnlVal >= 0 ? "+" : "",
-															"$",
-															primaryPnlVal.toFixed(2)
-														]
+														children: evalState.emaState || "N/A"
 													})]
 												}),
-												group.hedge && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+												evalState.minNotional !== void 0 && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 													style: {
-														display: "flex",
-														justifyContent: "space-between",
-														alignItems: "center",
-														padding: "8px 10px",
-														background: "var(--bg-secondary)",
-														borderRadius: "var(--radius-md)",
-														borderLeft: "3px solid var(--accent-gold)"
+														gridColumn: "span 2",
+														color: "var(--text-muted)"
 													},
-													children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
-														/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-															className: "badge",
-															style: {
-																background: "rgba(245, 158, 11, 0.15)",
-																color: "var(--accent-gold)",
-																fontSize: "8px",
-																padding: "1px 3px",
-																marginRight: "6px"
-															},
-															children: "HEDGE"
-														}),
-														/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
-															className: `badge ${group.hedge.type === "LONG" ? "badge-long" : "badge-short"}`,
-															style: {
-																fontSize: "9px",
-																marginRight: "6px"
-															},
-															children: [
-																group.hedge.type,
-																" ",
-																group.hedge.leverage,
-																"X"
-															]
-														}),
-														/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
-															style: {
-																fontSize: "11px",
-																color: "var(--text-secondary)",
-																fontFamily: "var(--font-mono)"
-															},
-															children: [
-																"Entry: $",
-																group.hedge.entryPrice.toLocaleString(void 0, { minimumFractionDigits: 2 }),
-																" | SL: $",
-																group.hedge.stopLoss.toLocaleString(),
-																" | TP: $",
-																group.hedge.takeProfit.toLocaleString()
-															]
-														})
-													] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
-														className: hedgePnlVal >= 0 ? "green-text" : "red-text",
-														style: {
-															fontFamily: "var(--font-mono)",
-															fontWeight: "bold",
-															fontSize: "12px"
-														},
+													children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Min Cost: " }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+														style: { color: "var(--text-secondary)" },
 														children: [
-															hedgePnlVal >= 0 ? "+" : "",
 															"$",
-															hedgePnlVal.toFixed(2),
-															" (",
-															hedgePnlVal >= 0 ? "+" : "",
-															hedgePct.toFixed(1),
-															"%)"
-														]
-													})]
-												}),
-												!group.hedge && isHedged && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-													style: {
-														display: "flex",
-														justifyContent: "space-between",
-														alignItems: "center",
-														padding: "8px 10px",
-														background: "var(--bg-secondary)",
-														borderRadius: "var(--radius-md)",
-														borderLeft: "3px solid var(--border-color)",
-														opacity: .6
-													},
-													children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-														className: "badge",
-														style: {
-															background: "var(--border-color)",
-															color: "var(--text-secondary)",
-															fontSize: "8px",
-															padding: "1px 3px",
-															marginRight: "6px"
-														},
-														children: "HEDGE"
-													}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-														className: "badge",
-														style: {
-															background: "var(--border-color)",
-															color: "var(--text-secondary)",
-															fontSize: "9px",
-															marginRight: "6px"
-														},
-														children: "CLOSED"
-													})] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
-														className: hedgePnlVal >= 0 ? "green-text" : "red-text",
-														style: {
-															fontFamily: "var(--font-mono)",
-															fontWeight: "bold",
-															fontSize: "12px"
-														},
-														children: [
-															"Realized: ",
-															hedgePnlVal >= 0 ? "+" : "",
-															"$",
-															hedgePnlVal.toFixed(2)
+															evalState.minNotional.toFixed(2),
+															" USDT"
 														]
 													})]
 												})
 											]
 										}),
-										/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-											style: {
-												borderTop: "1px solid var(--border-color)",
-												paddingTop: "10px",
-												display: "grid",
-												gridTemplateColumns: isHedged ? "repeat(4, 1fr)" : "repeat(2, 1fr)",
-												gap: "8px",
-												textAlign: "center",
-												fontSize: "11px"
-											},
-											children: [
-												/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-													style: {
-														color: "var(--text-secondary)",
-														fontSize: "9px",
-														textTransform: "uppercase"
-													},
-													children: "Combined PnL"
-												}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
-													className: combinedPnl >= 0 ? "green-text" : "red-text",
-													style: {
-														fontFamily: "var(--font-mono)",
-														fontWeight: "bold"
-													},
-													children: [
-														combinedPnl >= 0 ? "+" : "",
-														"$",
-														combinedPnl.toFixed(2)
-													]
-												})] }),
-												isHedged && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(import_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-													style: {
-														color: "var(--text-secondary)",
-														fontSize: "9px",
-														textTransform: "uppercase"
-													},
-													children: "Realized PnL"
-												}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
-													style: {
-														fontFamily: "var(--font-mono)",
-														fontWeight: "bold",
-														color: groupRealizedPnl >= 0 ? "var(--accent-green)" : "var(--accent-red)"
-													},
-													children: ["$", groupRealizedPnl.toFixed(2)]
-												})] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-													style: {
-														color: "var(--text-secondary)",
-														fontSize: "9px",
-														textTransform: "uppercase"
-													},
-													children: "Hedge Efficiency"
-												}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-													style: {
-														fontFamily: "var(--font-mono)",
-														fontWeight: "bold",
-														color: "var(--text-primary)"
-													},
-													children: hedgeEfficiency !== null ? `${hedgeEfficiency.toFixed(1)}%` : "N/A"
-												})] })] }),
-												/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-													style: {
-														color: "var(--text-secondary)",
-														fontSize: "9px",
-														textTransform: "uppercase"
-													},
-													children: "Risk Exposure"
-												}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
-													style: {
-														fontFamily: "var(--font-mono)",
-														fontWeight: "bold",
-														color: riskExposure > 100 ? "var(--accent-red)" : "var(--text-primary)"
-													},
-													children: [riskExposure.toFixed(1), "%"]
-												})] })
-											]
-										})
-									]
-								}, idx);
-							})
-						});
-					})() : activePosition ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-						style: {
-							background: "var(--bg-tertiary)",
-							border: "1px solid var(--border-color)",
-							borderRadius: "var(--radius-lg)",
-							padding: "16px",
-							position: "relative"
-						},
-						children: [
-							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-								style: {
-									display: "flex",
-									justifyContent: "space-between",
-									marginBottom: "12px"
-								},
-								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
-									className: `badge ${activePosition.type === "LONG" ? "badge-long" : "badge-short"}`,
-									children: [
-										activePosition.type,
-										" ",
-										activePosition.leverage,
-										"X"
-									]
-								}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
-									onClick: () => onClosePosition(),
-									className: "btn btn-secondary",
-									style: {
-										width: "auto",
-										padding: "4px 8px",
-										fontSize: "11px",
-										display: "flex",
-										gap: "4px",
-										alignItems: "center"
-									},
-									title: "Market Close Position",
-									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(X, { size: 12 }), " Close"]
-								})]
-							}),
-							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-								style: {
-									display: "grid",
-									gridTemplateColumns: "1fr 1fr",
-									gap: "12px 24px",
-									fontSize: "12px",
-									fontFamily: "var(--font-mono)"
-								},
-								children: [
-									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-										style: {
-											color: "var(--text-secondary)",
-											fontSize: "10px"
-										},
-										children: "ENTRY PRICE"
-									}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: ["$", activePosition.entryPrice.toLocaleString(void 0, { minimumFractionDigits: 2 })] })] }),
-									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-										style: {
-											color: "var(--text-secondary)",
-											fontSize: "10px"
-										},
-										children: "CURRENT PRICE"
-									}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: ["$", latestPrice.toLocaleString(void 0, { minimumFractionDigits: 2 })] })] }),
-									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-										style: {
-											color: "var(--text-secondary)",
-											fontSize: "10px"
-										},
-										children: "STOP LOSS (SL)"
-									}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-										className: "red-text",
-										children: ["$", activePosition.stopLoss.toLocaleString(void 0, { minimumFractionDigits: 2 })]
-									})] }),
-									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-										style: {
-											color: "var(--text-secondary)",
-											fontSize: "10px"
-										},
-										children: "TAKE PROFIT (TP)"
-									}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-										className: "green-text",
-										children: ["$", activePosition.takeProfit.toLocaleString(void 0, { minimumFractionDigits: 2 })]
-									})] }),
-									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-										style: {
-											color: "var(--text-secondary)",
-											fontSize: "10px"
-										},
-										children: "POSITION SIZE"
-									}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [activePosition.size.toFixed(4), " MOCK"] })] }),
-									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-										style: {
-											color: "var(--text-secondary)",
-											fontSize: "10px"
-										},
-										children: "TOTAL VALUE"
-									}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: ["$", (activePosition.size * activePosition.entryPrice).toFixed(2)] })] })
-								]
-							}),
-							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-								style: {
-									marginTop: "16px",
-									paddingTop: "12px",
-									borderTop: "1px solid var(--border-color)",
-									display: "flex",
-									justifyContent: "space-between",
-									alignItems: "center"
-								},
-								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-									style: {
-										fontSize: "13px",
-										fontWeight: "600"
-									},
-									children: "Unrealized PnL"
-								}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
-									className: livePnl.usd >= 0 ? "green-text" : "red-text",
-									style: {
-										fontFamily: "var(--font-mono)",
-										fontWeight: "bold",
-										fontSize: "16px"
-									},
-									children: [
-										livePnl.usd >= 0 ? "+" : "",
-										"$",
-										livePnl.usd.toFixed(2),
-										" (",
-										livePnl.usd >= 0 ? "+" : "",
-										livePnl.percent.toFixed(2),
-										"%)"
-									]
-								})]
-							})
-						]
-					}) : /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-						style: {
-							display: "flex",
-							flexDirection: "column",
-							alignItems: "center",
-							justifyContent: "center",
-							height: "100%",
-							color: "var(--text-muted)",
-							fontSize: "13px"
-						},
-						children: ["No active positions.", /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-							style: {
-								fontSize: "11px",
-								marginTop: "6px",
-								textAlign: "center",
-								maxWidth: "80%"
-							},
-							children: "Enable the bot simulation to automatically execute setups when indicators align."
-						})]
-					})
-				}),
-				activeTab === "logs" && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-					className: "log-list",
-					children: [logs.map((log) => {
-						const d = new Date(log.timestamp);
-						const timeStr = `${d.getHours().toString().padStart(2, "0")}:${d.getMinutes().toString().padStart(2, "0")}:${d.getSeconds().toString().padStart(2, "0")}`;
-						return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-							className: `log-item ${log.type}`,
-							children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
-								className: "log-time",
-								children: [
-									"[",
-									timeStr,
-									"]"
-								]
-							}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: log.text })]
-						}, log.id);
-					}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { ref: logEndRef })]
-				}),
-				activeTab === "history" && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-					style: {
-						height: "100%",
-						overflowY: "auto"
-					},
-					children: closedTrades.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("table", {
-						className: "trade-table",
-						style: { width: "100%" },
-						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("thead", { children: /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("tr", { children: [
-							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", { children: "Type" }),
-							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", { children: "Entry" }),
-							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", { children: "Exit" }),
-							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", { children: "Result (PnL)" }),
-							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", { children: "Reason" })
-						] }) }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("tbody", { children: [...closedTrades].reverse().map((trade) => /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("tr", { children: [
-							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("td", { children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-								className: `badge ${trade.type === "LONG" ? "badge-long" : "badge-short"}`,
-								children: trade.type
-							}) }),
-							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("td", { children: ["$", trade.entryPrice.toFixed(2)] }),
-							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("td", { children: ["$", trade.exitPrice?.toFixed(2)] }),
-							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("td", {
-								className: trade.pnl >= 0 ? "green-text" : "red-text",
-								children: [
-									trade.pnl >= 0 ? "+" : "",
-									"$",
-									trade.pnl.toFixed(2),
-									" (",
-									trade.pnlPercent.toFixed(2),
-									"%)"
-								]
-							}),
-							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("td", {
-								style: {
-									fontSize: "10px",
-									color: "var(--text-secondary)"
-								},
-								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-									className: `badge`,
-									style: {
-										backgroundColor: trade.exitReason === "TP" ? "var(--accent-green-bg)" : trade.exitReason === "SL" ? "var(--accent-red-bg)" : "var(--bg-tertiary)",
-										color: trade.exitReason === "TP" ? "var(--accent-green)" : trade.exitReason === "SL" ? "var(--accent-red)" : "var(--text-secondary)"
-									},
-									children: trade.exitReason
-								})
-							})
-						] }, trade.id)) })]
-					}) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-						style: {
-							display: "flex",
-							alignItems: "center",
-							justifyContent: "center",
-							height: "100%",
-							color: "var(--text-muted)",
-							fontSize: "13px"
-						},
-						children: "No trade history yet."
-					})
-				}),
-				activeTab === "diagnostics" && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-					style: {
-						padding: "16px",
-						height: "100%",
-						overflowY: "auto"
-					},
-					children: Object.keys(evaluationStates).length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-						style: {
-							display: "flex",
-							flexDirection: "column",
-							alignItems: "center",
-							justifyContent: "center",
-							height: "100%",
-							color: "var(--text-muted)"
-						},
-						children: ["No diagnostics data received.", /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-							style: {
-								fontSize: "11px",
-								marginTop: "6px",
-								textAlign: "center"
-							},
-							children: "Wait for the bot background loop to execute (ticking every 10 seconds)."
-						})]
-					}) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-						style: {
-							display: "grid",
-							gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))",
-							gap: "12px"
-						},
-						children: Object.keys(evaluationStates).map((symbol) => {
-							const evalState = evaluationStates[symbol];
-							if (!evalState) return null;
-							const rsi = parseFloat(evalState.rsi);
-							const adx = parseFloat(evalState.adx);
-							const isRsiOverbought = rsi >= 70;
-							const isRsiOversold = rsi <= 30;
-							const isAdxTrending = adx >= 25;
-							let badgeClass = "badge-secondary";
-							let statusColor = "var(--text-secondary)";
-							if (evalState.status === "POSITION_OPEN" || evalState.status === "EXECUTING") {
-								badgeClass = "badge-long";
-								statusColor = "var(--accent-green)";
-							} else if (evalState.status === "WAITING_FOR_SIGNAL") {
-								badgeClass = "badge-blue";
-								statusColor = "var(--accent-blue)";
-							} else if (evalState.status === "REJECTED" || evalState.status === "ERROR") {
-								badgeClass = "badge-short";
-								statusColor = "var(--accent-red)";
-							} else if (evalState.status === "COOLDOWN") {
-								badgeClass = "badge-gold";
-								statusColor = "var(--accent-gold)";
-							}
-							return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-								style: {
-									background: "var(--bg-tertiary)",
-									border: "1px solid var(--border-color)",
-									borderRadius: "var(--radius-md)",
-									padding: "12px",
-									display: "flex",
-									flexDirection: "column",
-									gap: "8px",
-									boxShadow: "0 2px 8px rgba(0, 0, 0, 0.05)",
-									transition: "all 0.2s",
-									cursor: "default"
-								},
-								onMouseEnter: (e) => {
-									e.currentTarget.style.borderColor = statusColor;
-									e.currentTarget.style.boxShadow = `0 0 10px ${statusColor}1A`;
-								},
-								onMouseLeave: (e) => {
-									e.currentTarget.style.borderColor = "var(--border-color)";
-									e.currentTarget.style.boxShadow = "0 2px 8px rgba(0, 0, 0, 0.05)";
-								},
-								children: [
-									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-										style: {
-											display: "flex",
-											justifyContent: "space-between",
-											alignItems: "center"
-										},
-										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-											style: {
-												fontWeight: "bold",
-												fontFamily: "var(--font-mono)",
-												fontSize: "13px"
-											},
-											children: symbol
-										}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-											className: `badge ${badgeClass}`,
-											style: {
-												fontSize: "9px",
-												padding: "2px 6px",
-												fontWeight: "bold",
-												letterSpacing: "0.5px",
-												...evalState.status === "WAITING_FOR_SIGNAL" ? {
-													backgroundColor: "rgba(59, 130, 246, 0.1)",
-													color: "#3b82f6",
-													border: "1px solid rgba(59, 130, 246, 0.2)"
-												} : {},
-												...evalState.status === "COOLDOWN" ? {
-													backgroundColor: "rgba(245, 158, 11, 0.1)",
-													color: "#f59e0b",
-													border: "1px solid rgba(245, 158, 11, 0.2)"
-												} : {}
-											},
-											children: evalState.status
-										})]
-									}),
-									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-										style: {
-											fontSize: "11px",
-											color: "var(--text-secondary)",
-											lineHeight: "1.4"
-										},
-										children: [
-											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", { children: "Decision:" }),
-											" ",
-											evalState.reason
-										]
-									}),
-									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-										style: {
-											display: "grid",
-											gridTemplateColumns: "1fr 1fr",
-											gap: "6px",
-											fontSize: "10px",
-											fontFamily: "var(--font-mono)",
-											borderTop: "1px solid var(--border-color)",
-											paddingTop: "8px",
-											marginTop: "4px"
-										},
-										children: [
-											/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-												style: { color: "var(--text-muted)" },
-												children: "RSI: "
-											}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-												style: {
-													fontWeight: "bold",
-													color: isRsiOverbought ? "var(--accent-red)" : isRsiOversold ? "var(--accent-green)" : "var(--text-primary)"
-												},
-												children: isNaN(rsi) ? "N/A" : rsi.toFixed(1)
-											})] }),
-											/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-												style: { color: "var(--text-muted)" },
-												children: "ADX: "
-											}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-												style: {
-													fontWeight: "bold",
-													color: isAdxTrending ? "var(--accent-green)" : "var(--text-muted)"
-												},
-												children: isNaN(adx) ? "N/A" : adx.toFixed(1)
-											})] }),
-											/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-												style: { gridColumn: "span 2" },
-												children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-													style: { color: "var(--text-muted)" },
-													children: "EMA: "
-												}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-													style: {
-														color: "var(--text-primary)",
-														fontWeight: "bold"
-													},
-													children: evalState.emaState || "N/A"
-												})]
-											}),
-											evalState.minNotional !== void 0 && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-												style: {
-													gridColumn: "span 2",
-													color: "var(--text-muted)"
-												},
-												children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Min Cost: " }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
-													style: { color: "var(--text-secondary)" },
-													children: [
-														"$",
-														evalState.minNotional.toFixed(2),
-														" USDT"
-													]
-												})]
-											})
-										]
-									}),
-									evalState.newsSentiment !== void 0 && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-										style: {
-											display: "flex",
-											flexDirection: "column",
-											gap: "4px",
-											fontSize: "10px",
-											borderTop: "1px solid var(--border-color)",
-											paddingTop: "6px",
-											marginTop: "4px"
-										},
-										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+										evalState.newsSentiment !== void 0 && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 											style: {
 												display: "flex",
-												justifyContent: "space-between",
-												fontFamily: "var(--font-mono)"
+												flexDirection: "column",
+												gap: "4px",
+												fontSize: "10px",
+												borderTop: "1px solid var(--border-color)",
+												paddingTop: "6px",
+												marginTop: "4px"
 											},
-											children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-												style: { color: "var(--text-muted)" },
-												children: "News: "
-											}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+											children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 												style: {
-													fontWeight: "bold",
-													color: evalState.newsSentiment >= 1.5 ? "var(--accent-green)" : evalState.newsSentiment <= -1.5 ? "var(--accent-red)" : "var(--text-primary)"
+													display: "flex",
+													justifyContent: "space-between",
+													fontFamily: "var(--font-mono)"
 												},
-												children: [evalState.newsSentiment > 0 ? "+" : "", evalState.newsSentiment.toFixed(2)]
-											})] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-												style: { color: "var(--text-muted)" },
-												children: "Whales: "
-											}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+												children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+													style: { color: "var(--text-muted)" },
+													children: "News: "
+												}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+													style: {
+														fontWeight: "bold",
+														color: evalState.newsSentiment >= 1.5 ? "var(--accent-green)" : evalState.newsSentiment <= -1.5 ? "var(--accent-red)" : "var(--text-primary)"
+													},
+													children: [evalState.newsSentiment > 0 ? "+" : "", evalState.newsSentiment.toFixed(2)]
+												})] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+													style: { color: "var(--text-muted)" },
+													children: "Whales: "
+												}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+													style: {
+														fontWeight: "bold",
+														color: evalState.whaleImbalance > 0 ? "var(--accent-green)" : evalState.whaleImbalance < 0 ? "var(--accent-red)" : "var(--text-primary)"
+													},
+													children: [evalState.whaleImbalance > 0 ? "+" : "", evalState.whaleImbalance.toFixed(2)]
+												})] })]
+											}), evalState.latestStory && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 												style: {
-													fontWeight: "bold",
-													color: evalState.whaleImbalance > 0 ? "var(--accent-green)" : evalState.whaleImbalance < 0 ? "var(--accent-red)" : "var(--text-primary)"
+													fontSize: "9px",
+													color: "var(--text-secondary)",
+													fontStyle: "italic",
+													textOverflow: "ellipsis",
+													overflow: "hidden",
+													whiteSpace: "nowrap",
+													maxWidth: "280px"
 												},
-												children: [evalState.whaleImbalance > 0 ? "+" : "", evalState.whaleImbalance.toFixed(2)]
-											})] })]
-										}), evalState.latestStory && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-											style: {
-												fontSize: "9px",
-												color: "var(--text-secondary)",
-												fontStyle: "italic",
-												textOverflow: "ellipsis",
-												overflow: "hidden",
-												whiteSpace: "nowrap",
-												maxWidth: "280px"
-											},
-											title: evalState.latestStory,
-											children: ["📰 ", evalState.latestStory]
-										})]
-									})
-								]
-							}, symbol);
+												title: evalState.latestStory,
+												children: ["📰 ", evalState.latestStory]
+											})]
+										})
+									]
+								}, symbol);
+							})
 						})
 					})
-				})
-			]
-		})]
+				]
+			})
+		]
 	});
 };
 //#endregion
@@ -15073,7 +15328,13 @@ function App() {
 		dailyDrawdownPercent: 0,
 		circuitBreakerTriggered: false,
 		maskedApiKey: "",
-		maskedApiSecret: ""
+		maskedApiSecret: "",
+		isHedgeMode: false,
+		rpm: 0,
+		rateLimitRemaining: 1e3,
+		lastRateLimitEvent: null,
+		scanPaused: false,
+		wsConnected: false
 	});
 	const [symbol, setSymbol] = (0, import_react.useState)("BTC/USDT, ETH/USDT, SOL/USDT, DOGE/USDT, ALGO/USDT, ADA/USDT, XRP/USDT, LTC/USDT, LINK/USDT, DOT/USDT, AVAX/USDT, BNB/USDT, NEAR/USDT, MATIC/USDT, UNI/USDT, SUI/USDT, APT/USDT");
 	const [viewedSymbol, setViewedSymbol] = (0, import_react.useState)("BTC/USDT");
@@ -15141,7 +15402,13 @@ function App() {
 						dailyDrawdownPercent: data.dailyDrawdownPercent,
 						circuitBreakerTriggered: data.circuitBreakerTriggered,
 						maskedApiKey: data.maskedApiKey,
-						maskedApiSecret: data.maskedApiSecret
+						maskedApiSecret: data.maskedApiSecret,
+						isHedgeMode: data.isHedgeMode,
+						rpm: data.rpm,
+						rateLimitRemaining: data.rateLimitRemaining,
+						lastRateLimitEvent: data.lastRateLimitEvent,
+						scanPaused: data.scanPaused,
+						wsConnected: data.wsConnected
 					});
 					setBotActive(data.botActive);
 					setAllPositions(data.allPositions || []);
@@ -15201,7 +15468,7 @@ function App() {
 		userToken,
 		hasUnappliedChanges
 	]);
-	const handleConnectExchange = async (exchangeId, apiKey, apiSecret, isTestnet) => {
+	const handleConnectExchange = async (exchangeId, apiKey, apiSecret, isTestnet, apiPassphrase) => {
 		try {
 			const res = await fetch("/api/connect", {
 				method: "POST",
@@ -15213,7 +15480,8 @@ function App() {
 					exchangeId,
 					apiKey,
 					apiSecret,
-					isTestnet
+					isTestnet,
+					apiPassphrase
 				})
 			});
 			if (res.status === 401) {
@@ -15925,7 +16193,8 @@ function App() {
 										latestPrice: currentPrice,
 										allPositions: currentAllPositions,
 										evaluationStates,
-										accountBalance: account.balance
+										accountBalance: account.balance,
+										exchangeStatus
 									})]
 								})
 							]

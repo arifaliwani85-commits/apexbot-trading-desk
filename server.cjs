@@ -4,6 +4,7 @@ const dotenv = require('dotenv');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const WebSocket = require('ws');
 
 let ccxt = null;
 function getCcxt() {
@@ -198,6 +199,20 @@ function getOrCreateSession(username) {
     circuitBreakerTriggered: false,
     cooldowns: {}, // symbol -> timestamp of exit
     evaluationStates: {}, // symbol -> EvaluationState
+    rateLimitStats: {
+      requestsLastMinute: 0,
+      limitRemaining: 1000,
+      lastEventTime: null,
+      scanPausedUntil: 0
+    },
+    wsConnected: false,
+    macroCandlesMap: {},
+    macroCandlesLastFetched: {},
+    cachedBalance: 0,
+    balanceLastFetched: 0,
+    cachedPositionsMap: {},
+    positionsLastFetched: 0,
+    forceRefreshExchangeData: false,
     stratSettings: profile.stratSettings || {
       strategyType: 'TREND_FOLLOWING',
       emaShortPeriod: 20,
@@ -246,19 +261,32 @@ function getOrCreateSession(username) {
         const creds = JSON.parse(decrypted);
         session.exchangeConfig = creds;
 
-        const exchangeClass = getCcxt()[creds.exchangeId];
+        const ccxtExchangeId = creds.exchangeId === 'kucoin' ? 'kucoinfutures' : creds.exchangeId;
+        const exchangeClass = getCcxt()[ccxtExchangeId];
         if (exchangeClass) {
-          session.exchangeInstance = new exchangeClass({
+          const initOptions = {
             apiKey: creds.apiKey,
             secret: creds.apiSecret,
             enableRateLimit: true,
             timeout: 10000,
-          });
+          };
+          if (creds.exchangeId === 'bybit') {
+            initOptions.options = { 
+              defaultType: 'swap',
+              adjustForTimeDifference: true,
+              recvWindow: 10000
+            };
+          } else if (creds.exchangeId === 'kucoin' && creds.apiPassphrase) {
+            initOptions.password = creds.apiPassphrase;
+          }
+          session.exchangeInstance = new exchangeClass(initOptions);
           if (creds.isTestnet && session.exchangeInstance.setSandboxMode) {
             session.exchangeInstance.setSandboxMode(true);
           }
           session.connectionStatus = 'CONNECTED';
-          session.exchangeInstance.loadMarkets().catch(e => console.error('Failed to load markets:', e));
+          session.exchangeInstance.loadMarkets().then(() => {
+            initSessionWebSocket(session);
+          }).catch(e => console.error('Failed to load markets:', e));
           session.addLog(`Auto-loaded exchange keys. Connected to ${creds.exchangeId.toUpperCase()} (${creds.isTestnet ? 'TESTNET' : 'MAINNET'}).`, 'success');
         }
       }
@@ -318,6 +346,528 @@ function getMarketSymbol(session, symbol) {
   return target;
 }
 
+async function getExchangePositionMode(session, symbol) {
+  if (session.exchangeConfig && session.exchangeConfig.exchangeId === 'kucoin') {
+    return 'ONE_WAY';
+  }
+  if (!session.exchangeInstance) return session.isHedgeMode ? 'HEDGE' : 'ONE_WAY'; // mock mode
+  try {
+    const marketSymbol = getMarketSymbol(session, symbol);
+    await session.exchangeInstance.loadMarkets();
+    const positions = await session.exchangeInstance.fetchPositions([marketSymbol]);
+    if (positions && positions.length > 0) {
+      let foundHedge = false;
+      let foundOneWay = false;
+      for (const p of positions) {
+        const rawIdx = p.positionIdx !== undefined ? p.positionIdx : (p.info ? (p.info.positionIdx || p.info.position_idx) : undefined);
+        if (rawIdx !== undefined) {
+          const pIdx = parseInt(rawIdx);
+          if (pIdx === 1 || pIdx === 2) {
+            foundHedge = true;
+          } else if (pIdx === 0) {
+            foundOneWay = true;
+          }
+        }
+      }
+      if (foundHedge) return 'HEDGE';
+      if (foundOneWay) return 'ONE_WAY';
+    }
+  } catch (err) {
+    session.addLog(`Position Mode Query Warning for ${symbol}: ${err.message}`, 'warning');
+  }
+  return session.isHedgeMode ? 'HEDGE' : 'ONE_WAY';
+}
+
+async function callExchange(session, method, ...args) {
+  if (!session.exchangeInstance) {
+    throw new Error('Exchange is not connected.');
+  }
+
+  // 1. Check if scanning is paused due to rate limits
+  if (session.rateLimitStats && session.rateLimitStats.scanPausedUntil && Date.now() < session.rateLimitStats.scanPausedUntil) {
+    const waitTime = Math.ceil((session.rateLimitStats.scanPausedUntil - Date.now()) / 1000);
+    throw new Error(`Exchange calls are temporarily paused. Cooldown active for another ${waitTime}s.`);
+  }
+
+  // 2. Queue / throttling check (200ms spacing between REST requests)
+  const minDelay = 200;
+  if (session.lastRequestTime) {
+    const elapsed = Date.now() - session.lastRequestTime;
+    if (elapsed < minDelay) {
+      await sleep(minDelay - elapsed);
+    }
+  }
+  session.lastRequestTime = Date.now();
+
+  // 3. Track request counts in sliding 60s window
+  const now = Date.now();
+  if (!session.requestTimestamps) session.requestTimestamps = [];
+  session.requestTimestamps.push(now);
+  session.requestTimestamps = session.requestTimestamps.filter(t => now - t < 60000);
+  
+  if (!session.rateLimitStats) {
+    session.rateLimitStats = { requestsLastMinute: 0, limitRemaining: 1000, lastEventTime: null, scanPausedUntil: 0 };
+  }
+  session.rateLimitStats.requestsLastMinute = session.requestTimestamps.length;
+
+  let retries = 3;
+  let delay = 1000;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const result = await session.exchangeInstance[method](...args);
+      
+      // Parse rate limit headers from Bybit response headers if available
+      if (session.exchangeInstance.last_response_headers) {
+        const headers = session.exchangeInstance.last_response_headers;
+        const limit = headers['x-bapi-limit-status'] || headers['x-bapi-limit-status-linear'] || headers['x-bapi-limit-status-inverse'];
+        if (limit !== undefined) {
+          session.rateLimitStats.limitRemaining = parseInt(limit);
+        }
+      }
+      
+      return result;
+    } catch (err) {
+      const errMsg = err.message || '';
+      const isRateLimit = errMsg.includes('Too many visits') || 
+                           errMsg.includes('10006') || 
+                           errMsg.includes('rateLimit') || 
+                           errMsg.includes('RateLimitExceeded') ||
+                           err.name === 'RateLimitExceeded';
+                           
+      if (isRateLimit) {
+        session.rateLimitStats.lastEventTime = Date.now();
+        session.rateLimitStats.scanPausedUntil = Date.now() + 60000;
+        session.addLog(`[RATE LIMIT DETECTED] Bybit API returned rate limit error. Pausing scan for 60 seconds. Error: ${errMsg}`, 'danger');
+        
+        // Retrying orders with backoff
+        if (method === 'createMarketOrder' || method === 'privatePostPositionTradingStop') {
+          if (attempt < retries) {
+            session.addLog(`Retrying order execution (${attempt}/${retries}) in ${delay}ms after rate limit...`, 'warning');
+            await sleep(delay);
+            delay *= 2;
+            continue;
+          }
+        }
+      }
+      
+      throw err;
+    }
+  }
+}
+
+function initSessionWebSocket(session) {
+  if (!session.exchangeInstance || session.connectionStatus !== 'CONNECTED') return;
+  if (session.exchangeConfig.exchangeId !== 'bybit') return;
+  
+  if (session.wsClient) {
+    try {
+      session.wsClient.close();
+    } catch (e) {}
+  }
+
+  const url = session.exchangeConfig.isTestnet 
+    ? 'wss://stream-testnet.bybit.com/v5/public/linear' 
+    : 'wss://stream.bybit.com/v5/public/linear';
+
+  session.addLog(`Connecting public WebSocket to Bybit: ${url}`, 'info');
+  const ws = new WebSocket(url);
+  session.wsClient = ws;
+
+  ws.on('open', () => {
+    session.wsConnected = true;
+    session.addLog('WebSocket connection established. Subscribing to kline topics...', 'success');
+    
+    // Subscribe to all active symbols
+    const args = session.activeSymbols.map(sym => {
+      const formatted = sym.replace('/', '').split(':')[0]; // e.g. BTC/USDT -> BTCUSDT
+      return `kline.5.${formatted}`;
+    });
+    
+    if (args.length > 0) {
+      ws.send(JSON.stringify({
+        op: 'subscribe',
+        args: args
+      }));
+    }
+  });
+
+  ws.on('message', (data) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      if (msg && msg.topic && msg.topic.startsWith('kline.5.')) {
+        const rawSym = msg.topic.substring(8); // e.g. BTCUSDT
+        
+        // Find corresponding symbol format used by the bot (e.g. BTC/USDT)
+        const matchedSymbol = session.activeSymbols.find(sym => {
+          return sym.replace('/', '').split(':')[0] === rawSym;
+        });
+
+        if (matchedSymbol && msg.data && msg.data.length > 0) {
+          const k = msg.data[0];
+          const start = parseInt(k.start);
+          const open = parseFloat(k.open);
+          const high = parseFloat(k.high);
+          const low = parseFloat(k.low);
+          const close = parseFloat(k.close);
+          const volume = parseFloat(k.volume);
+
+          if (!session.candlesMap) session.candlesMap = {};
+          let candles = session.candlesMap[matchedSymbol];
+          
+          if (candles && candles.length > 0) {
+            const lastCandle = candles[candles.length - 1];
+            if (start === lastCandle.time) {
+              // Update last candle in-place
+              lastCandle.open = open;
+              lastCandle.high = high;
+              lastCandle.low = low;
+              lastCandle.close = close;
+              lastCandle.volume = volume;
+            } else if (start > lastCandle.time) {
+              // Push new candle
+              candles.push({
+                time: start,
+                open,
+                high,
+                low,
+                close,
+                volume
+              });
+              if (candles.length > 500) {
+                candles.shift();
+              }
+            }
+            
+            // Recalculate indicators on updated candle list
+            session.candlesMap[matchedSymbol] = computeIndicators(candles, session.stratSettings);
+            session.lastTickPrices[matchedSymbol] = close;
+          }
+        }
+      }
+    } catch (e) {
+      console.error('Error parsing WebSocket message:', e.message);
+    }
+  });
+
+  ws.on('error', (err) => {
+    session.addLog(`WebSocket error: ${err.message}`, 'warning');
+    session.wsConnected = false;
+  });
+
+  ws.on('close', () => {
+    session.addLog('WebSocket connection closed.', 'warning');
+    session.wsConnected = false;
+    
+    // Auto reconnect after 5 seconds if session is still active and connected
+    if (session.connectionStatus === 'CONNECTED' && session.wsClient === ws) {
+      setTimeout(() => {
+        if (session.connectionStatus === 'CONNECTED') {
+          initSessionWebSocket(session);
+        }
+      }, 5000);
+    }
+  });
+}
+
+function closeSessionWebSocket(session) {
+  if (session.wsClient) {
+    try {
+      session.wsClient.close();
+    } catch (e) {}
+    session.wsClient = null;
+    session.wsConnected = false;
+  }
+}
+
+async function setExchangeStopLossTakeProfit(session, symbol, positionIdx, stopLoss, takeProfit, trailingStop = null) {
+  if (!session.exchangeInstance) return true; // mock mode
+  const marketSymbol = getMarketSymbol(session, symbol);
+  
+  if (session.exchangeConfig && session.exchangeConfig.exchangeId === 'kucoin') {
+    try {
+      await session.exchangeInstance.loadMarkets();
+      
+      // 1. Cancel all existing stop orders for this symbol first
+      session.addLog(`[Kucoin Protection] Canceling previous trigger orders for ${symbol}...`, 'info');
+      try {
+        await callExchange(session, 'cancelAllOrders', marketSymbol, { stop: true });
+      } catch (err) {
+        session.addLog(`[Kucoin Protection] Note: cancelAllOrders returned: ${err.message}`, 'warning');
+      }
+
+      if (!stopLoss && !takeProfit) {
+        return true;
+      }
+
+      // 2. Fetch active position details to know size and sideToClose
+      const positions = await callExchange(session, 'fetchPositions', [marketSymbol]);
+      const activePos = positions.find(p => p.contracts > 0 || Math.abs(parseFloat(p.info?.currentQty || 0)) > 0);
+      if (!activePos) {
+        session.addLog(`[Kucoin Protection] No active position found to attach protection for ${symbol}.`, 'warning');
+        return false;
+      }
+
+      const posSize = Math.abs(parseInt(activePos.contracts !== undefined ? activePos.contracts : (activePos.info?.currentQty || 0)));
+      const posQty = parseFloat(activePos.contracts !== undefined ? activePos.contracts : (activePos.info?.currentQty || 0));
+      const posType = posQty > 0 ? 'LONG' : 'SHORT';
+      const sideToClose = posType === 'LONG' ? 'sell' : 'buy';
+
+      if (posSize === 0) {
+        session.addLog(`[Kucoin Protection] Position size is zero for ${symbol}. Skipping protection placement.`, 'warning');
+        return false;
+      }
+
+      // 3. Attach Stop Loss stop order
+      if (stopLoss) {
+        const slPriceFormatted = parseFloat(session.exchangeInstance.priceToPrecision(marketSymbol, parseFloat(stopLoss)));
+        session.addLog(`[Kucoin Protection] Placing Stop Loss trigger order at $${slPriceFormatted} (Contracts: ${posSize})...`, 'info');
+        await callExchange(session, 'createOrder', marketSymbol, 'market', sideToClose, posSize, undefined, {
+          stopLossPrice: slPriceFormatted,
+          stopPriceType: 'TP',
+          reduceOnly: true
+        });
+      }
+
+      // 4. Attach Take Profit stop order
+      if (takeProfit) {
+        const tpPriceFormatted = parseFloat(session.exchangeInstance.priceToPrecision(marketSymbol, parseFloat(takeProfit)));
+        session.addLog(`[Kucoin Protection] Placing Take Profit trigger order at $${tpPriceFormatted} (Contracts: ${posSize})...`, 'info');
+        await callExchange(session, 'createOrder', marketSymbol, 'market', sideToClose, posSize, undefined, {
+          takeProfitPrice: tpPriceFormatted,
+          stopPriceType: 'TP',
+          reduceOnly: true
+        });
+      }
+
+      session.addLog(`[Kucoin Protection] Successfully set Stop Loss ($${stopLoss || 'N/A'}) and Take Profit ($${takeProfit || 'N/A'}) for ${symbol}.`, 'success');
+      return true;
+    } catch (err) {
+      session.addLog(`[Kucoin Protection] Failed to set protection for ${symbol}: ${err.message}`, 'danger');
+      return false;
+    }
+  }
+
+  try {
+    await session.exchangeInstance.loadMarkets();
+    const market = session.exchangeInstance.markets[marketSymbol];
+    const rawSymbol = market ? market.id : marketSymbol.split(':')[0].replace('/', '');
+
+    const params = {
+      category: 'linear',
+      symbol: rawSymbol,
+      tpslMode: 'Full',
+      positionIdx: positionIdx,
+    };
+
+    if (stopLoss) {
+      if (isNaN(stopLoss) || parseFloat(stopLoss) <= 0) {
+        session.addLog(`Warning: Invalid stopLoss value ${stopLoss} for ${symbol}. Skipping SL placement.`, 'warning');
+      } else {
+        try {
+          params.stopLoss = session.exchangeInstance.priceToPrecision(marketSymbol, parseFloat(stopLoss));
+        } catch (e) {
+          params.stopLoss = parseFloat(stopLoss).toFixed(2);
+        }
+      }
+    }
+    if (takeProfit) {
+      if (isNaN(takeProfit) || parseFloat(takeProfit) <= 0) {
+        session.addLog(`Warning: Invalid takeProfit value ${takeProfit} for ${symbol}. Skipping TP placement.`, 'warning');
+      } else {
+        try {
+          params.takeProfit = session.exchangeInstance.priceToPrecision(marketSymbol, parseFloat(takeProfit));
+        } catch (e) {
+          params.takeProfit = parseFloat(takeProfit).toFixed(2);
+        }
+      }
+    }
+    if (trailingStop) {
+      if (isNaN(trailingStop) || parseFloat(trailingStop) <= 0) {
+        session.addLog(`Warning: Invalid trailingStop value ${trailingStop} for ${symbol}. Skipping TS placement.`, 'warning');
+      } else {
+        try {
+          params.trailingStop = session.exchangeInstance.priceToPrecision(marketSymbol, parseFloat(trailingStop));
+        } catch (e) {
+          params.trailingStop = parseFloat(trailingStop).toFixed(2);
+        }
+      }
+    }
+
+    if (!params.stopLoss && !params.takeProfit && !params.trailingStop) {
+      session.addLog(`Warning: No valid SL/TP/TS values to attach for ${symbol}.`, 'warning');
+      return false;
+    }
+
+    let attempts = 3;
+    let delay = 1000;
+    for (let i = 1; i <= attempts; i++) {
+      try {
+        session.addLog(`Attaching SL/TP/TS on Bybit for ${symbol} (Attempt ${i}/${attempts}): idx=${positionIdx}, SL=${params.stopLoss || 'N/A'}, TP=${params.takeProfit || 'N/A'}, TS=${params.trailingStop || 'N/A'}`, 'info');
+        const response = await callExchange(session, 'privatePostPositionTradingStop', params);
+        session.addLog(`Successfully attached SL/TP/TS on Bybit for ${symbol}: ${JSON.stringify(response)}`, 'success');
+        return true;
+      } catch (err) {
+        const errMsg = err.message || '';
+        session.addLog(`Attempt ${i} failed to attach SL/TP/TS on Bybit for ${symbol}: ${errMsg}`, 'warning');
+        const isTransient = errMsg.includes('position size is zero') || 
+                            errMsg.includes('not have position') ||
+                            errMsg.includes('timeout') ||
+                            errMsg.includes('Rate limit') ||
+                            errMsg.includes('rateLimit') ||
+                            errMsg.includes('Too many visits') ||
+                            errMsg.includes('10006');
+        if (isTransient && i < attempts) {
+          await new Promise(r => setTimeout(r, delay));
+          delay *= 1.5;
+        } else {
+          throw err;
+        }
+      }
+    }
+  } catch (err) {
+    session.addLog(`Failed to attach SL/TP/TS on Bybit for ${symbol}: ${err.message}`, 'danger');
+    return false;
+  }
+}
+
+async function verifyAndEnforceProtection(session, symbol, positionIdx, type, entryPrice, stopLossPrice, takeProfitPrice) {
+  if (!session.exchangeInstance) return true; // mock mode
+  const marketSymbol = getMarketSymbol(session, symbol);
+  
+  // Calculate trailing stop distance if enabled
+  let trailingStopDistance = null;
+  if (session.riskSettings.trailingStopEnabled && !type.includes('HEDGE')) { // trailing stop for primary / single trades
+    const slDistance = Math.abs(entryPrice - stopLossPrice);
+    trailingStopDistance = slDistance;
+  }
+
+  const pKey = `${symbol}_${type}`;
+  let posRecord = session.activePositions[pKey];
+  if (posRecord) {
+    posRecord.tpStatus = 'PENDING';
+    posRecord.slStatus = 'PENDING';
+    posRecord.tsStatus = trailingStopDistance ? 'PENDING' : 'DISABLED';
+  }
+
+  let attempts = 3;
+  let delay = 1000;
+  
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    session.addLog(`[Protection Enforcement] Setting protection on Bybit for ${symbol} (${type}) - Attempt ${attempt}/${attempts}...`, 'info');
+    
+    // 1. Attach protection orders
+    const attachOk = await setExchangeStopLossTakeProfit(
+      session, 
+      symbol, 
+      positionIdx, 
+      stopLossPrice, 
+      takeProfitPrice, 
+      trailingStopDistance
+    );
+    
+    if (!attachOk) {
+      session.addLog(`[Protection Enforcement] Failed to send attachment request to Bybit on attempt ${attempt}.`, 'warning');
+      await sleep(delay);
+      delay *= 1.5;
+      continue;
+    }
+    
+    // Wait a brief moment for the exchange to process the attachment
+    await sleep(800);
+    
+    // 2. Fetch position/trigger details to verify
+    try {
+      let slAttached = false;
+      let tpAttached = false;
+      let tsAttached = !trailingStopDistance;
+      let exStopLoss = 0;
+      let exTakeProfit = 0;
+      let exTrailingStop = 0;
+
+      if (session.exchangeConfig && session.exchangeConfig.exchangeId === 'kucoin') {
+        const sideToClose = type === 'LONG' ? 'sell' : 'buy';
+        const openStops = await callExchange(session, 'fetchOpenOrders', marketSymbol, undefined, undefined, { stop: true });
+        
+        const slOrder = openStops.find(o => o.side === sideToClose && Math.abs((o.triggerPrice !== undefined ? o.triggerPrice : o.stopPrice) - stopLossPrice) / stopLossPrice < 0.01);
+        const tpOrder = openStops.find(o => o.side === sideToClose && Math.abs((o.triggerPrice !== undefined ? o.triggerPrice : o.stopPrice) - takeProfitPrice) / takeProfitPrice < 0.01);
+
+        if (slOrder) {
+          slAttached = true;
+          exStopLoss = slOrder.triggerPrice !== undefined ? slOrder.triggerPrice : slOrder.stopPrice;
+        }
+        if (tpOrder) {
+          tpAttached = true;
+          exTakeProfit = tpOrder.triggerPrice !== undefined ? tpOrder.triggerPrice : tpOrder.stopPrice;
+        }
+      } else {
+        // Bybit verify logic
+        const rawPositions = await callExchange(session, 'fetchPositions', [marketSymbol]);
+        const exPos = rawPositions.find(p => {
+          const rawIdx = p.positionIdx !== undefined ? p.positionIdx : (p.info ? (p.info.positionIdx || p.info.position_idx) : undefined);
+          return parseInt(rawIdx) === positionIdx;
+        });
+        
+        if (!exPos) {
+          session.addLog(`[Protection Enforcement] Warning: Could not find active position on Bybit to verify protection.`, 'warning');
+          await sleep(delay);
+          delay *= 1.5;
+          continue;
+        }
+        
+        exStopLoss = parseFloat(exPos.stopLoss || exPos.info?.stopLoss || 0);
+        exTakeProfit = parseFloat(exPos.takeProfit || exPos.info?.takeProfit || 0);
+        exTrailingStop = parseFloat(exPos.trailingStop || exPos.info?.trailingStop || 0);
+        
+        slAttached = exStopLoss > 0 && Math.abs(exStopLoss - stopLossPrice) / stopLossPrice < 0.01;
+        tpAttached = exTakeProfit > 0 && Math.abs(exTakeProfit - takeProfitPrice) / takeProfitPrice < 0.01;
+        tsAttached = !trailingStopDistance || (exTrailingStop > 0 && Math.abs(exTrailingStop - trailingStopDistance) / trailingStopDistance < 0.01);
+      }
+      
+      session.addLog(`[Protection Verify] Symbol: ${symbol} | Side: ${type} | Entry: $${entryPrice.toFixed(2)} | Target SL: $${stopLossPrice.toFixed(2)} (Ex: $${exStopLoss.toFixed(2)}) | Target TP: $${takeProfitPrice.toFixed(2)} (Ex: $${exTakeProfit.toFixed(2)}) | Target TS: ${trailingStopDistance ? '$' + trailingStopDistance.toFixed(2) : 'DISABLED'} (Ex: $${exTrailingStop.toFixed(2)})`, 'info');
+      
+      if ((!stopLossPrice || slAttached) && (!takeProfitPrice || tpAttached) && tsAttached) {
+        session.addLog(`[Protection Verification] SUCCESS! Protection verified on ${session.exchangeConfig.exchangeId.toUpperCase()} for ${symbol} (${type}).`, 'success');
+        
+        // Update local session position status
+        if (posRecord) {
+          posRecord.tpStatus = 'ATTACHED';
+          posRecord.slStatus = 'ATTACHED';
+          posRecord.tsStatus = trailingStopDistance ? 'ATTACHED' : 'DISABLED';
+          posRecord.protectionWarning = null;
+        }
+        return true;
+      } else {
+        session.addLog(`[Protection Verification] Verification mismatch on attempt ${attempt}. SL Attached: ${slAttached}, TP Attached: ${tpAttached}, TS Attached: ${tsAttached}`, 'warning');
+      }
+    } catch (fetchErr) {
+      session.addLog(`[Protection Verification] Error fetching protection on attempt ${attempt}: ${fetchErr.message}`, 'warning');
+    }
+    
+    await sleep(delay);
+    delay *= 1.5;
+  }
+  
+  // If we reach here, we failed to verify protection after 3 attempts
+  session.addLog(`[CRITICAL] Protection verification failed after all retries for ${symbol} (${type}). SAFETY RULE TRIGGERED: Closing position immediately to prevent unprotected risk!`, 'danger');
+  
+  if (posRecord) {
+    posRecord.tpStatus = 'MISSING';
+    posRecord.slStatus = 'MISSING';
+    posRecord.tsStatus = trailingStopDistance ? 'MISSING' : 'DISABLED';
+    posRecord.protectionWarning = 'CRITICAL: Verification failed! Safety auto-closed.';
+  }
+  
+  try {
+    // Force immediate close order
+    await executeCloseOrder(session, pKey, 'PROTECTION_FAILED');
+    session.addLog(`[SAFETY ROLLBACK] Successfully closed unprotected position for ${symbol} (${type}).`, 'success');
+  } catch (closeErr) {
+    session.addLog(`[SAFETY ROLLBACK ERROR] Failed to close unprotected position for ${symbol} (${type}): ${closeErr.message}`, 'danger');
+  }
+  
+  return false;
+}
+
 function getMinOrderSize(session, marketSymbol, price) {
   if (!session.exchangeInstance || !session.exchangeInstance.markets) return 0;
   const market = session.exchangeInstance.markets[marketSymbol];
@@ -344,15 +894,27 @@ function getMinOrderSize(session, marketSymbol, price) {
   return Math.max(minAmount, sizeFromCost);
 }
 
-async function safeCreateMarketOrder(exchangeInstance, symbol, side, amount, params = {}, addLog) {
+async function safeCreateMarketOrder(session, symbol, side, amount, params = {}, addLog) {
   let attempts = 3;
   let delay = 1000;
   const ccxtLib = getCcxt();
 
+  if (amount === undefined || amount === null || isNaN(amount) || amount <= 0) {
+    const errorMsg = `Aborted placing order: Invalid order size/amount calculated (value: ${amount})`;
+    addLog(errorMsg, 'danger');
+    throw new Error(errorMsg);
+  }
+
+  const isHedge = params.positionIdx === 1 || params.positionIdx === 2;
+  const posModeLabel = isHedge ? 'HEDGE MODE' : 'ONE-WAY MODE';
+  addLog(`[ORDER PLACEMENT DIAGNOSTIC] Position Mode: ${posModeLabel} | positionIdx: ${params.positionIdx !== undefined ? params.positionIdx : 'N/A'} | Symbol: ${symbol} | Side: ${side.toUpperCase()} | Amount: ${amount} | Payload: ${JSON.stringify(params)}`, 'info');
+
   for (let i = 1; i <= attempts; i++) {
     try {
       addLog(`Sending Market Order to Exchange (Attempt ${i}/${attempts}): ${side.toUpperCase()} ${amount} ${symbol} (params: ${JSON.stringify(params)})`, 'info');
-      const order = await exchangeInstance.createMarketOrder(symbol, side, amount, undefined, params);
+      const order = session.exchangeInstance 
+        ? await callExchange(session, 'createMarketOrder', symbol, side, amount, undefined, params)
+        : { price: session.lastTickPrices[symbol] || 1.0, average: session.lastTickPrices[symbol] || 1.0, amount };
       return order;
     } catch (err) {
       const isTransient = (ccxtLib.NetworkError && err instanceof ccxtLib.NetworkError) ||
@@ -360,7 +922,9 @@ async function safeCreateMarketOrder(exchangeInstance, symbol, side, amount, par
                           (ccxtLib.RateLimitExceeded && err instanceof ccxtLib.RateLimitExceeded) ||
                           err.message.includes('timeout') ||
                           err.message.includes('Rate limit') ||
-                          err.message.includes('rateLimit');
+                          err.message.includes('rateLimit') ||
+                          err.message.includes('Too many visits') ||
+                          err.message.includes('10006');
 
       if (isTransient && i < attempts) {
         addLog(`Transient exchange error (Attempt ${i} failed): ${err.message}. Retrying in ${delay}ms...`, 'warning');
@@ -1132,21 +1696,32 @@ app.post('/api/auth/logout', (req, res) => {
 
 app.post('/api/connect', requireAuth, async (req, res) => {
   const session = req.userSession;
-  const { exchangeId, apiKey, apiSecret, isTestnet } = req.body;
+  const { exchangeId, apiKey, apiSecret, apiPassphrase, isTestnet } = req.body;
   session.addLog(`Attempting to connect to ${exchangeId.toUpperCase()}...`, 'info');
 
   try {
-    const exchangeClass = getCcxt()[exchangeId];
+    const ccxtExchangeId = exchangeId === 'kucoin' ? 'kucoinfutures' : exchangeId;
+    const exchangeClass = getCcxt()[ccxtExchangeId];
     if (!exchangeClass) {
       throw new Error(`Exchange ${exchangeId} is not supported by CCXT.`);
     }
 
-    const testExchange = new exchangeClass({
+    const initOptions = {
       apiKey,
       secret: apiSecret,
       enableRateLimit: true,
       timeout: 10000,
-    });
+    };
+    if (exchangeId === 'bybit') {
+      initOptions.options = { 
+        defaultType: 'swap',
+        adjustForTimeDifference: true,
+        recvWindow: 10000
+      };
+    } else if (exchangeId === 'kucoin' && apiPassphrase) {
+      initOptions.password = apiPassphrase;
+    }
+    const testExchange = new exchangeClass(initOptions);
 
     if (isTestnet && testExchange.setSandboxMode) {
       testExchange.setSandboxMode(true);
@@ -1158,13 +1733,16 @@ app.post('/api/connect', requireAuth, async (req, res) => {
     // Success: Update session state
     session.exchangeInstance = testExchange;
     session.connectionStatus = 'CONNECTED';
-    session.exchangeConfig = { exchangeId, apiKey, apiSecret, isTestnet };
+    session.exchangeConfig = { exchangeId, apiKey, apiSecret, apiPassphrase, isTestnet };
     session.circuitBreakerTriggered = false; // Reset circuit breaker on successful connection
+    
+    // Start WebSocket stream
+    initSessionWebSocket(session);
 
     // Write securely to local db file
     const profile = loadUserProfile(session.username);
     if (profile) {
-      const credsString = JSON.stringify({ exchangeId, apiKey, apiSecret, isTestnet });
+      const credsString = JSON.stringify({ exchangeId, apiKey, apiSecret, apiPassphrase, isTestnet });
       profile.encryptedExchangeConfig = encryptText(credsString);
       saveUserProfile(profile);
     }
@@ -1200,6 +1778,7 @@ app.post('/api/connect', requireAuth, async (req, res) => {
 
 app.post('/api/disconnect', requireAuth, (req, res) => {
   const session = req.userSession;
+  closeSessionWebSocket(session);
   session.exchangeInstance = null;
   session.connectionStatus = 'DISCONNECTED';
   session.exchangeConfig = { exchangeId: 'binance', apiKey: '', apiSecret: '', isTestnet: true };
@@ -1229,14 +1808,19 @@ app.get('/api/status', requireAuth, async (req, res) => {
     }
   }
 
-  let exchangeBalance = 0;
+  let exchangeBalance = session.cachedBalance || 0;
   
   if (session.exchangeInstance && session.connectionStatus === 'CONNECTED') {
-    try {
-      const balanceData = await session.exchangeInstance.fetchBalance();
-      exchangeBalance = balanceData.total.USDT || balanceData.total.BUSD || 0;
-    } catch (e) {
-      session.addLog(`Failed to fetch live balance: ${e.message}`, 'warning');
+    // If cache is empty, populate it once, otherwise rely on cached balance refreshed in background loop
+    if (!session.cachedBalance) {
+      try {
+        const balanceData = await callExchange(session, 'fetchBalance');
+        exchangeBalance = balanceData.total.USDT || balanceData.total.BUSD || 0;
+        session.cachedBalance = exchangeBalance;
+        session.balanceLastFetched = Date.now();
+      } catch (e) {
+        session.addLog(`Failed to fetch initial balance: ${e.message}`, 'warning');
+      }
     }
   }
 
@@ -1272,12 +1856,15 @@ app.get('/api/status', requireAuth, async (req, res) => {
     botActive: session.botActive,
     symbol: session.currentSymbol,
     activeSymbols: session.activeSymbols,
-    activePosition: session.activePositions[session.currentSymbol] || null,
+    activePosition: session.activePositions[session.currentSymbol] ||
+                    session.activePositions[`${session.currentSymbol}_LONG`] ||
+                    session.activePositions[`${session.currentSymbol}_SHORT`] || null,
     allPositions: Object.values(session.activePositions).filter(Boolean),
     candles: (session.candlesMap[session.currentSymbol] || []).slice(-100),
     dailyDrawdownPercent,
     dailyStartEquity: session.dailyStartEquity,
     circuitBreakerTriggered: session.circuitBreakerTriggered,
+    isHedgeMode: session.isHedgeMode || false,
     // Add masked configuration credentials
     maskedApiKey: session.exchangeConfig.apiKey ? `${session.exchangeConfig.apiKey.slice(0, 4)}...${session.exchangeConfig.apiKey.slice(-4)}` : '',
     maskedApiSecret: session.exchangeConfig.apiSecret ? '********************************' : '',
@@ -1285,6 +1872,12 @@ app.get('/api/status', requireAuth, async (req, res) => {
     riskSettings: session.riskSettings,
     evaluationStates: session.evaluationStates || {},
     newsSentiment: globalNewsSentiment || {},
+    // Rate limit and WebSocket stats
+    rpm: session.rateLimitStats ? session.rateLimitStats.requestsLastMinute : 0,
+    rateLimitRemaining: session.rateLimitStats ? session.rateLimitStats.limitRemaining : 1000,
+    lastRateLimitEvent: session.rateLimitStats ? session.rateLimitStats.lastEventTime : null,
+    scanPaused: !!(session.rateLimitStats && session.rateLimitStats.scanPausedUntil && Date.now() < session.rateLimitStats.scanPausedUntil),
+    wsConnected: session.wsConnected || false
   });
 });
 
@@ -1295,14 +1888,22 @@ app.get('/api/logs', requireAuth, (req, res) => {
 app.post('/api/close-position', requireAuth, async (req, res) => {
   const session = req.userSession;
   const targetSym = req.body.symbol || session.currentSymbol;
-  const pos = session.activePositions[targetSym];
-  if (!pos) {
+
+  // Find any active position keys that match the symbol or symbol_LONG / symbol_SHORT
+  const matchingKeys = Object.keys(session.activePositions).filter(k => 
+    (k === targetSym || k === `${targetSym}_LONG` || k === `${targetSym}_SHORT`) && 
+    session.activePositions[k]
+  );
+
+  if (matchingKeys.length === 0) {
     return res.status(400).json({ success: false, error: `No active position open for ${targetSym}.` });
   }
 
-  session.addLog(`Request received to manually market close position for ${targetSym}...`, 'warning');
+  session.addLog(`Request received to manually market close position(s) for ${targetSym}...`, 'warning');
   try {
-    await executeCloseOrder(session, targetSym, 'MANUAL');
+    for (const key of matchingKeys) {
+      await executeCloseOrder(session, key, 'MANUAL');
+    }
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -1416,19 +2017,26 @@ async function checkVolatilityAndLiquidity(session, symbol, latestCandle) {
 async function verifyHedgeMode(session, symbol) {
   if (!session.exchangeInstance) return true; // mock mode
   try {
-    if (!session.isHedgeMode) {
+    const marketSymbol = getMarketSymbol(session, symbol);
+    
+    // 1. Check current mode on the exchange
+    let currentMode = await getExchangePositionMode(session, symbol);
+    session.addLog(`[POSITION MODE DIAGNOSTIC] Current exchange mode for ${symbol} is ${currentMode}`, 'info');
+    
+    if (currentMode === 'ONE_WAY') {
       session.addLog(`Exchange is currently in One-Way mode. Attempting to switch to Hedge Mode for Bybit...`, 'info');
       try {
-        const marketSymbol = getMarketSymbol(session, symbol);
         await session.exchangeInstance.setPositionMode(true, marketSymbol);
-        session.isHedgeMode = true;
-        session.addLog(`Successfully set Hedge Mode on Bybit for ${symbol}.`, 'success');
+        // Verify again
+        currentMode = await getExchangePositionMode(session, symbol);
+        session.addLog(`[POSITION MODE DIAGNOSTIC] Mode after switch attempt for ${symbol} is ${currentMode}`, 'info');
       } catch (switchErr) {
-        // Some accounts have it globally set or require specific symbol param
         session.addLog(`Note: Direct Hedge Mode switch returned: ${switchErr.message}.`, 'warning');
       }
     }
-    return true;
+    
+    session.isHedgeMode = (currentMode === 'HEDGE');
+    return session.isHedgeMode;
   } catch (err) {
     session.addLog(`Hedge Mode Error: Exchange does not support Hedge Mode or setting failed: ${err.message}`, 'danger');
     return false;
@@ -1445,9 +2053,15 @@ async function executeCloseOrder(session, symbolKey, reason, customSize = null) 
   const tickerPrice = session.lastTickPrices[cleanSymbol] || pos.entryPrice;
 
   const marketSymbol = getMarketSymbol(session, cleanSymbol);
-  session.addLog(`Sending Close Order (${closeSide.toUpperCase()}) on Exchange for ${sizeToClose.toFixed(4)} ${cleanSymbol.split('/')[0]}...`, 'info');
-
+  
   try {
+    // Query active position mode dynamically before closing
+    const activeMode = await getExchangePositionMode(session, cleanSymbol);
+    session.isHedgeMode = (activeMode === 'HEDGE');
+    session.addLog(`[CLOSE DIAGNOSTIC] Symbol: ${cleanSymbol} | Active Position Mode: ${activeMode} | Position Type: ${pos.type} | Size: ${sizeToClose}`, 'info');
+
+    session.addLog(`Sending Close Order (${closeSide.toUpperCase()}) on Exchange for ${sizeToClose.toFixed(4)} ${cleanSymbol.split('/')[0]}...`, 'info');
+
     let fillPrice = tickerPrice;
 
     if (session.exchangeInstance) {
@@ -1466,10 +2080,13 @@ async function executeCloseOrder(session, symbolKey, reason, customSize = null) 
         finalCloseSize = sizeToClose;
       }
 
-      const closeParams = session.isHedgeMode ? { positionIdx: pos.type === 'LONG' ? 1 : 2 } : { positionIdx: 0 };
+      const closeParams = session.isHedgeMode 
+        ? { positionIdx: pos.type === 'LONG' ? 1 : 2, reduceOnly: true } 
+        : { positionIdx: 0, reduceOnly: true };
       // Place real market order on exchange to close
-      const order = await safeCreateMarketOrder(session.exchangeInstance, marketSymbol, closeSide, finalCloseSize, closeParams, (txt, typ) => session.addLog(txt, typ));
+      const order = await safeCreateMarketOrder(session, marketSymbol, closeSide, finalCloseSize, closeParams, (txt, typ) => session.addLog(txt, typ));
       fillPrice = order.price || order.average || tickerPrice;
+      session.forceRefreshExchangeData = true;
       session.addLog(`Exchange Fill success for ${cleanSymbol}. Closed size ${sizeToClose.toFixed(4)} at average price $${fillPrice}.`, 'success');
     } else {
       session.addLog(`Simulation Note: Exchange client disconnected. Filled closing order locally at ticker price.`, 'warning');
@@ -1540,8 +2157,23 @@ setInterval(async () => {
       const now = new Date();
       const todayStr = `${now.getUTCFullYear()}-${now.getUTCMonth()}-${now.getUTCDate()}`;
 
-      const balanceData = await session.exchangeInstance.fetchBalance();
-      const exchangeBalance = balanceData.total.USDT || balanceData.total.BUSD || 0;
+      // Cache balance query (every 30 seconds or if forced)
+      const balanceCacheExpiry = 30000;
+      const shouldFetchBalance = !session.balanceLastFetched || 
+                                 (Date.now() - session.balanceLastFetched > balanceCacheExpiry) ||
+                                 session.forceRefreshExchangeData;
+                                 
+      let exchangeBalance = session.cachedBalance || 0;
+      if (shouldFetchBalance) {
+        try {
+          const balanceData = await callExchange(session, 'fetchBalance');
+          exchangeBalance = balanceData.total.USDT || balanceData.total.BUSD || 0;
+          session.cachedBalance = exchangeBalance;
+          session.balanceLastFetched = Date.now();
+        } catch (balErr) {
+          console.error(`Failed to fetch exchange balance for ${session.username}:`, balErr.message);
+        }
+      }
 
       if (session.lastCircuitBreakerCheckDate === '' || todayStr !== session.lastCircuitBreakerCheckDate) {
         session.dailyStartEquity = exchangeBalance;
@@ -1622,53 +2254,91 @@ setInterval(async () => {
         ? Array.from(new Set([...session.activeSymbols, ...activePositionsSymbols])).filter(Boolean)
         : Array.from(new Set([session.currentSymbol || 'BTC/USDT', ...activePositionsSymbols])).filter(Boolean);
 
-      // Fetch active exchange positions for safety sync to prevent double-entries
-      let exchangePositionsMap = {};
-      let isHedgeMode = false;
-      try {
-        if (session.exchangeInstance.has['fetchPositions']) {
-          const symbolsForFetch = symbolsToProcess.map(s => getMarketSymbol(session, s));
-          const positions = await session.exchangeInstance.fetchPositions(symbolsForFetch);
-          for (const p of positions) {
-            // Check position index to determine Hedge Mode dynamically
-            const rawIdx = p.positionIdx !== undefined ? p.positionIdx : (p.info ? (p.info.positionIdx || p.info.position_idx) : undefined);
-            const pIdx = parseInt(rawIdx);
-            if (pIdx === 1 || pIdx === 2) {
-              isHedgeMode = true;
+      // Fetch active exchange positions with caching (every 20 seconds or if forced)
+      let exchangePositionsMap = session.cachedPositionsMap || {};
+      let openStops = session.cachedOpenStops || [];
+      let isHedgeMode = session.isHedgeMode || false;
+      const positionsCacheExpiry = 20000;
+      
+      const shouldFetchPositions = !session.positionsLastFetched || 
+                                   (Date.now() - session.positionsLastFetched > positionsCacheExpiry) ||
+                                   session.forceRefreshExchangeData;
+                                   
+      if (shouldFetchPositions) {
+        try {
+          if (session.exchangeInstance.has['fetchPositions']) {
+            const symbolsForFetch = symbolsToProcess.map(s => getMarketSymbol(session, s));
+            const positions = await callExchange(session, 'fetchPositions', symbolsForFetch);
+            
+            if (session.exchangeConfig && session.exchangeConfig.exchangeId === 'kucoin') {
+              try {
+                openStops = await callExchange(session, 'fetchOpenOrders', undefined, undefined, undefined, { stop: true });
+                session.cachedOpenStops = openStops;
+              } catch (stopErr) {
+                console.error(`Failed to fetch Kucoin open stop orders for ${session.username}:`, stopErr.message);
+              }
             }
+            
+            exchangePositionsMap = {};
+            for (const p of positions) {
+              const rawIdx = p.positionIdx !== undefined ? p.positionIdx : (p.info ? (p.info.positionIdx || p.info.position_idx) : undefined);
+              const pIdx = parseInt(rawIdx);
+              if (pIdx === 1 || pIdx === 2) {
+                isHedgeMode = true;
+              }
 
-            const baseSymbol = p.symbol.split(':')[0]; // e.g. BTC/USDT:USDT -> BTC/USDT
-            const side = p.side ? p.side.toUpperCase() : '';
-            const contracts = parseFloat(p.contracts || p.size || 0);
-            if (contracts > 0 && (side === 'LONG' || side === 'SHORT' || side === 'BUY' || side === 'SELL')) {
-              const sideKey = (side === 'LONG' || side === 'BUY') ? 'LONG' : 'SHORT';
-              exchangePositionsMap[`${baseSymbol}_${sideKey}`] = p;
+              const baseSymbol = p.symbol.split(':')[0]; // e.g. BTC/USDT:USDT -> BTC/USDT
+              const side = p.side ? p.side.toUpperCase() : '';
+              const contracts = parseFloat(p.contracts || p.size || 0);
+              if (contracts > 0 && (side === 'LONG' || side === 'SHORT' || side === 'BUY' || side === 'SELL')) {
+                const sideKey = (side === 'LONG' || side === 'BUY') ? 'LONG' : 'SHORT';
+                exchangePositionsMap[`${baseSymbol}_${sideKey}`] = p;
+              }
             }
+            session.cachedPositionsMap = exchangePositionsMap;
+            session.positionsLastFetched = Date.now();
+            session.isHedgeMode = isHedgeMode;
+            session.forceRefreshExchangeData = false;
           }
+        } catch (posErr) {
+          console.error(`Failed to fetch exchange positions for ${session.username}:`, posErr.message);
         }
-      } catch (posErr) {
-        console.error(`Failed to fetch exchange positions for ${session.username}:`, posErr.message);
       }
-      session.isHedgeMode = isHedgeMode;
 
-      // 3. Process the active/selected symbol and open positions sequentially (respect rate limits)
+      // 3. Process the active/selected symbol and open positions sequentially
       for (const symbol of symbolsToProcess) {
         try {
           const marketSymbol = getMarketSymbol(session, symbol);
           const timeframe = '5m';
-          const ohlcv = await session.exchangeInstance.fetchOHLCV(marketSymbol, timeframe, undefined, 500);
-
-          const fetchedCandles = ohlcv.map((c) => ({
-            time: c[0],
-            open: c[1],
-            high: c[2],
-            low: c[3],
-            close: c[4],
-            volume: c[5],
-          }));
-
-          const calculatedCandles = computeIndicators(fetchedCandles, session.stratSettings);
-          session.candlesMap[symbol] = calculatedCandles;
+          
+          let calculatedCandles = session.candlesMap[symbol];
+          
+          // Skip REST call if WebSocket is updating and we have history
+          const needsInit = !calculatedCandles || calculatedCandles.length < 100;
+          
+          if (needsInit || !session.wsConnected) {
+            try {
+              session.addLog(`Fetching 5m candles for ${symbol} via REST API (WS Connected: ${session.wsConnected ? 'YES' : 'NO'}, Cached Count: ${calculatedCandles ? calculatedCandles.length : 0})...`, 'info');
+              const ohlcv = await callExchange(session, 'fetchOHLCV', marketSymbol, timeframe, undefined, 500);
+              const fetchedCandles = ohlcv.map((c) => ({
+                time: c[0],
+                open: c[1],
+                high: c[2],
+                low: c[3],
+                close: c[4],
+                volume: c[5],
+              }));
+              calculatedCandles = computeIndicators(fetchedCandles, session.stratSettings);
+              session.candlesMap[symbol] = calculatedCandles;
+              session.lastTickPrices[symbol] = fetchedCandles[fetchedCandles.length - 1].close;
+            } catch (ohlcvErr) {
+              session.addLog(`Failed to fetch 5m candles for ${symbol}: ${ohlcvErr.message}`, 'warning');
+              if (!calculatedCandles) {
+                continue; // Can't evaluate indicator signals without data
+              }
+            }
+          }
+          
           const latestCandle = calculatedCandles[calculatedCandles.length - 1];
           const tickerPrice = latestCandle.close;
           session.lastTickPrices[symbol] = tickerPrice;
@@ -1710,6 +2380,72 @@ setInterval(async () => {
                 session.activePositions[key] = pos;
                 session.addLog(`Synced active ${posType} position for ${symbol} from exchange (Size: ${exSize}).`, 'info');
               }
+              
+              // Read exchange-side SL/TP/TS values
+              let exStopLoss = parseFloat(exPos.stopLoss || exPos.info?.stopLoss || 0);
+              let exTakeProfit = parseFloat(exPos.takeProfit || exPos.info?.takeProfit || 0);
+              const exTrailingStop = parseFloat(exPos.trailingStop || exPos.info?.trailingStop || 0);
+
+              if (session.exchangeConfig && session.exchangeConfig.exchangeId === 'kucoin') {
+                const sideToClose = posType === 'LONG' ? 'sell' : 'buy';
+                const marketSymbol = getMarketSymbol(session, symbol);
+                const entry = parseFloat(exPos.entryPrice || tickerPrice);
+                
+                // Filter openStops for this symbol and sideToClose
+                const symbolStops = openStops.filter(o => {
+                  const oSymbol = o.symbol ? o.symbol.split(':')[0] : '';
+                  const targetBaseSymbol = marketSymbol.split(':')[0];
+                  return oSymbol === targetBaseSymbol && o.side === sideToClose;
+                });
+                
+                for (const o of symbolStops) {
+                  const trigPrice = parseFloat(o.triggerPrice !== undefined ? o.triggerPrice : (o.stopPrice || 0));
+                  if (trigPrice > 0) {
+                    const isSL = posType === 'LONG' ? (trigPrice < entry) : (trigPrice > entry);
+                    if (isSL) {
+                      exStopLoss = trigPrice;
+                    } else {
+                      exTakeProfit = trigPrice;
+                    }
+                  }
+                }
+              }
+              
+              if (exStopLoss > 0) pos.stopLoss = exStopLoss;
+              if (exTakeProfit > 0) pos.takeProfit = exTakeProfit;
+              
+              pos.slStatus = exStopLoss > 0 ? 'ATTACHED' : 'MISSING';
+              pos.tpStatus = exTakeProfit > 0 ? 'ATTACHED' : 'MISSING';
+              
+              const isTsEnabled = session.riskSettings.trailingStopEnabled && !key.includes('HEDGE');
+              pos.tsStatus = isTsEnabled ? (exTrailingStop > 0 ? 'ATTACHED' : 'MISSING') : 'DISABLED';
+
+              if (pos.slStatus === 'MISSING' || pos.tpStatus === 'MISSING') {
+                pos.protectionWarning = 'Warning: Missing Protection!';
+                
+                if (!pos.protectionMissingSince) {
+                  pos.protectionMissingSince = Date.now();
+                }
+                
+                const missingDuration = Date.now() - pos.protectionMissingSince;
+                if (missingDuration > 30000) { // 30 seconds
+                  session.addLog(`[Safety Check] Position for ${symbol} (${pos.type}) missing protection for >30s. Attempting background recovery...`, 'warning');
+                  const pIdx = session.isHedgeMode ? (pos.type === 'LONG' ? 1 : 2) : 0;
+                  const reAttachOk = await setExchangeStopLossTakeProfit(session, symbol, pIdx, pos.stopLoss, pos.takeProfit, isTsEnabled ? Math.abs(pos.entryPrice - pos.stopLoss) : null);
+                  if (reAttachOk) {
+                    pos.protectionMissingSince = null;
+                    pos.protectionWarning = null;
+                    session.addLog(`[Safety Check] Successfully recovered protection background for ${symbol} (${pos.type}).`, 'success');
+                  } else {
+                    session.addLog(`[Safety Check] Failed to recover protection background. SAFETY RULE TRIGGERED: Closing position immediately!`, 'danger');
+                    await executeCloseOrder(session, key, 'PROTECTION_FAILED');
+                  }
+                }
+              } else {
+                pos.protectionMissingSince = null;
+                pos.protectionWarning = null;
+              }
+              
             } else {
               if (pos) {
                 session.addLog(`Position for ${symbol} (${pos.type}) closed externally. Clearing local status.`, 'warning');
@@ -1789,6 +2525,10 @@ setInterval(async () => {
                   pos.stopLoss = pos.entryPrice - slDistance * 0.2;
                 }
                 session.addLog(`Locked in profit. Adjusted Stop Loss for remaining 50% position of ${symbol} to $${pos.stopLoss.toFixed(2)} (Risk-free).`, 'info');
+                
+                // Update Stop Loss on Exchange
+                const pIdx = session.isHedgeMode ? (pos.type === 'LONG' ? 1 : 2) : 0;
+                await setExchangeStopLossTakeProfit(session, symbol, pIdx, pos.stopLoss, pos.takeProfit);
               }
             }
 
@@ -1803,6 +2543,10 @@ setInterval(async () => {
                   if (newSL > pos.stopLoss) {
                     pos.stopLoss = newSL;
                     session.addLog(`Trailing Stop adjusted higher for LONG ${symbol} to $${newSL.toFixed(2)}.`, 'info');
+                    
+                    // Update Stop Loss on Exchange
+                    const pIdx = session.isHedgeMode ? 1 : 0;
+                    await setExchangeStopLossTakeProfit(session, symbol, pIdx, newSL, pos.takeProfit);
                   }
                 }
               } else {
@@ -1812,6 +2556,10 @@ setInterval(async () => {
                   if (newSL < pos.stopLoss) {
                     pos.stopLoss = newSL;
                     session.addLog(`Trailing Stop adjusted lower for SHORT ${symbol} to $${newSL.toFixed(2)}.`, 'info');
+                    
+                    // Update Stop Loss on Exchange
+                    const pIdx = session.isHedgeMode ? 2 : 0;
+                    await setExchangeStopLossTakeProfit(session, symbol, pIdx, newSL, pos.takeProfit);
                   }
                 }
               }
@@ -1967,7 +2715,18 @@ setInterval(async () => {
           // Check Multi-Timeframe Trend filter (using 1H for 5m strategy macro filter)
           if (session.stratSettings.useMultiTimeframe) {
             try {
-              const ohlcvMacro = await session.exchangeInstance.fetchOHLCV(marketSymbol, '1h', undefined, 100);
+              let ohlcvMacro = session.macroCandlesMap[symbol];
+              const macroCacheAge = session.macroCandlesLastFetched[symbol] ? (Date.now() - session.macroCandlesLastFetched[symbol]) : Infinity;
+
+              if (!ohlcvMacro || macroCacheAge > 5 * 60 * 1000) { // 5 minutes cache expiry
+                session.addLog(`Fetching 1H macro candles for ${symbol} via REST...`, 'info');
+                ohlcvMacro = await callExchange(session, 'fetchOHLCV', marketSymbol, '1h', undefined, 100);
+                session.macroCandlesMap[symbol] = ohlcvMacro;
+                session.macroCandlesLastFetched[symbol] = Date.now();
+              } else {
+                session.addLog(`Using cached 1H macro trend for ${symbol} (age: ${Math.round(macroCacheAge / 1000)}s)`, 'info');
+              }
+
               const closesMacro = ohlcvMacro.map((c) => c[4]);
               const ema20_macro = calculateEMA(closesMacro, 20);
               const ema50_macro = calculateEMA(closesMacro, 50);
@@ -2066,6 +2825,15 @@ setInterval(async () => {
             size = parseFloat(size.toFixed(4));
           }
 
+          if (size < minSize) {
+            evaluation.status = 'REJECTED';
+            evaluation.reason = `Scaled size ${size.toFixed(4)} is below exchange minimum of ${minSize.toFixed(4)}. Account balance is too small to trade this symbol at leverage ${session.riskSettings.leverage}X.`;
+            session.evaluationStates[symbol] = evaluation;
+            logTickDetails(session.username, symbol, evaluation);
+            session.addLog(`Risk Manager: Scaled size (${size.toFixed(4)}) is below exchange minimum (${minSize.toFixed(4)}) for ${symbol}. Skipping trade.`, 'danger');
+            continue;
+          }
+
           if (size <= 0) {
             evaluation.status = 'REJECTED';
             evaluation.reason = `Precision rounding reduced size to 0. Cannot execute.`;
@@ -2145,6 +2913,28 @@ setInterval(async () => {
               }
             }
 
+            if (sizePrimary < minSizePri || sizeHedge < minSizePri) {
+              evaluation.status = 'REJECTED';
+              evaluation.reason = `Hedged Dual Engine: scaled size (Pri: ${sizePrimary.toFixed(4)}, Hdg: ${sizeHedge.toFixed(4)}) fell below minimum (${minSizePri.toFixed(4)}). Account balance is too small.`;
+              session.evaluationStates[symbol] = evaluation;
+              logTickDetails(session.username, symbol, evaluation);
+              session.addLog(`Hedged Dual Engine Error: Scaled size fell below exchange minimum for ${symbol}. Skipping trade.`, 'danger');
+              continue;
+            }
+
+            const requiredMarginPri = (sizePrimary * tickerPrice) / primaryLev;
+            const requiredMarginHdg = (sizeHedge * tickerPrice) / hedgeLev;
+            const totalRequiredMargin = requiredMarginPri + requiredMarginHdg;
+
+            if (exchangeBalance < totalRequiredMargin) {
+              evaluation.status = 'REJECTED';
+              evaluation.reason = `Hedged Dual Engine: required margin $${totalRequiredMargin.toFixed(2)} exceeds available balance $${exchangeBalance.toFixed(2)}. Position size is too small for account balance.`;
+              session.evaluationStates[symbol] = evaluation;
+              logTickDetails(session.username, symbol, evaluation);
+              session.addLog(`Hedged Dual Engine Error: Required margin ($${totalRequiredMargin.toFixed(2)}) exceeds available balance ($${exchangeBalance.toFixed(2)}). Skipping trade.`, 'danger');
+              continue;
+            }
+
             if (sizePrimary <= 0 || sizeHedge <= 0) {
               evaluation.status = 'REJECTED';
               evaluation.reason = `Precision rounding reduced size to 0. Cannot execute.`;
@@ -2174,11 +2964,47 @@ setInterval(async () => {
             let primaryOrder = null;
             let hedgeOrder = null;
 
+            const primaryParams = { positionIdx: primaryIdx };
+            if (slPrice > 0) {
+              try {
+                primaryParams.stopLoss = session.exchangeInstance.priceToPrecision(marketSymbol, slPrice);
+              } catch (e) {
+                primaryParams.stopLoss = slPrice.toString();
+              }
+            }
+            if (tpPrice > 0) {
+              try {
+                primaryParams.takeProfit = session.exchangeInstance.priceToPrecision(marketSymbol, tpPrice);
+              } catch (e) {
+                primaryParams.takeProfit = tpPrice.toString();
+              }
+            }
+
+            // Settle estimates for hedge SL/TP based on ticker price first
+            const hedgeSlVal = parseFloat((tickerPrice * (decision.signal === 'BUY' ? 1.05 : 0.95)).toFixed(2));
+            const hedgeTpVal = parseFloat((tickerPrice * (decision.signal === 'BUY' ? 0.90 : 1.10)).toFixed(2));
+
+            const hedgeParams = { positionIdx: hedgeIdx };
+            if (hedgeSlVal > 0) {
+              try {
+                hedgeParams.stopLoss = session.exchangeInstance.priceToPrecision(marketSymbol, hedgeSlVal);
+              } catch (e) {
+                hedgeParams.stopLoss = hedgeSlVal.toString();
+              }
+            }
+            if (hedgeTpVal > 0) {
+              try {
+                hedgeParams.takeProfit = session.exchangeInstance.priceToPrecision(marketSymbol, hedgeTpVal);
+              } catch (e) {
+                hedgeParams.takeProfit = hedgeTpVal.toString();
+              }
+            }
+
             try {
               if (session.exchangeInstance) {
                 const results = await Promise.all([
-                  safeCreateMarketOrder(session.exchangeInstance, marketSymbol, primarySide, sizePrimary, { positionIdx: primaryIdx }, (txt, typ) => session.addLog(`[Primary] ${txt}`, typ)),
-                  safeCreateMarketOrder(session.exchangeInstance, marketSymbol, hedgeSide, sizeHedge, { positionIdx: hedgeIdx }, (txt, typ) => session.addLog(`[Hedge] ${txt}`, typ))
+                  safeCreateMarketOrder(session, marketSymbol, primarySide, sizePrimary, primaryParams, (txt, typ) => session.addLog(`[Primary] ${txt}`, typ)),
+                  safeCreateMarketOrder(session, marketSymbol, hedgeSide, sizeHedge, hedgeParams, (txt, typ) => session.addLog(`[Hedge] ${txt}`, typ))
                 ]);
                 primaryOrder = results[0];
                 hedgeOrder = results[1];
@@ -2189,6 +3015,10 @@ setInterval(async () => {
 
               const primaryFill = primaryOrder.price || primaryOrder.average || tickerPrice;
               const hedgeFill = hedgeOrder.price || hedgeOrder.average || tickerPrice;
+
+              // Recalculate actual hedge SL/TP based on execution fill price
+              const actualHedgeSl = parseFloat((hedgeFill * (decision.signal === 'BUY' ? 1.05 : 0.95)).toFixed(2));
+              const actualHedgeTp = parseFloat((hedgeFill * (decision.signal === 'BUY' ? 0.90 : 1.10)).toFixed(2));
 
               const livePriId = `live_pri_${Date.now()}`;
               const liveHdgId = `live_hdg_${Date.now()}`;
@@ -2225,8 +3055,8 @@ setInterval(async () => {
                 entryTime: Date.now(),
                 size: sizeHedge,
                 leverage: hedgeLev,
-                stopLoss: parseFloat((hedgeFill * (decision.signal === 'BUY' ? 1.05 : 0.95)).toFixed(2)),
-                takeProfit: parseFloat((hedgeFill * (decision.signal === 'BUY' ? 0.90 : 1.10)).toFixed(2)),
+                stopLoss: actualHedgeSl,
+                takeProfit: actualHedgeTp,
                 target1Price: parseFloat((hedgeFill * (decision.signal === 'BUY' ? 0.925 : 1.075)).toFixed(2)),
                 halfClosed: false,
                 pnl: 0,
@@ -2240,6 +3070,17 @@ setInterval(async () => {
                 pairedPositionId: livePriId,
                 maxLeveragedPnL: 0,
               };
+
+              // Verify and enforce protection post-fill for safety
+              const primaryRole = decision.signal === 'BUY' ? 'LONG' : 'SHORT';
+              const hedgeRole = decision.signal === 'BUY' ? 'SHORT' : 'LONG';
+              
+              await Promise.all([
+                verifyAndEnforceProtection(session, symbol, primaryIdx, primaryRole, primaryFill, slPrice, tpPrice),
+                verifyAndEnforceProtection(session, symbol, hedgeIdx, hedgeRole, hedgeFill, actualHedgeSl, actualHedgeTp)
+              ]);
+
+              session.forceRefreshExchangeData = true;
 
               evaluation.status = 'POSITION_OPEN';
               evaluation.reason = `Executed Hedged entries for ${symbol}`;
@@ -2256,7 +3097,7 @@ setInterval(async () => {
                 try {
                   const closeSide = primarySide === 'buy' ? 'sell' : 'buy';
                   const closeParams = session.isHedgeMode ? { positionIdx: primaryIdx } : { positionIdx: 0 };
-                  await safeCreateMarketOrder(session.exchangeInstance, marketSymbol, closeSide, sizePrimary, closeParams, (txt, typ) => session.addLog(`[Rollback Pri] ${txt}`, typ));
+                  await safeCreateMarketOrder(session, marketSymbol, closeSide, sizePrimary, closeParams, (txt, typ) => session.addLog(`[Rollback Pri] ${txt}`, typ));
                   session.addLog(`Rollback: Cleaned up primary position.`, 'success');
                 } catch (priErr) {
                   session.addLog(`Rollback Error: Failed to clean up primary position: ${priErr.message}`, 'danger');
@@ -2267,7 +3108,7 @@ setInterval(async () => {
                 try {
                   const closeSide = hedgeSide === 'buy' ? 'sell' : 'buy';
                   const closeParams = session.isHedgeMode ? { positionIdx: hedgeIdx } : { positionIdx: 0 };
-                  await safeCreateMarketOrder(session.exchangeInstance, marketSymbol, closeSide, sizeHedge, closeParams, (txt, typ) => session.addLog(`[Rollback Hdg] ${txt}`, typ));
+                  await safeCreateMarketOrder(session, marketSymbol, closeSide, sizeHedge, closeParams, (txt, typ) => session.addLog(`[Rollback Hdg] ${txt}`, typ));
                   session.addLog(`Rollback: Cleaned up hedge position.`, 'success');
                 } catch (hdgErr) {
                   session.addLog(`Rollback Error: Failed to clean up hedge position: ${hdgErr.message}`, 'danger');
@@ -2283,13 +3124,44 @@ setInterval(async () => {
           } else {
             // Standard single execution
             const tradeSide = decision.signal === 'BUY' ? 'buy' : 'sell';
+            
+            // 1. Query the exchange's current position mode dynamically before placing order
+            const activeMode = await getExchangePositionMode(session, symbol);
+            session.isHedgeMode = (activeMode === 'HEDGE');
+            session.addLog(`[ENTRY DIAGNOSTIC] Symbol: ${symbol} | Active Position Mode: ${activeMode} | Signal: ${decision.signal}`, 'info');
+
             const entryParams = session.isHedgeMode ? { positionIdx: decision.signal === 'BUY' ? 1 : 2 } : { positionIdx: 0 };
             
+            // Attach SL/TP directly to the order params
+            if (slPrice > 0) {
+              try {
+                entryParams.stopLoss = session.exchangeInstance.priceToPrecision(marketSymbol, slPrice);
+              } catch (e) {
+                entryParams.stopLoss = slPrice.toString();
+              }
+            }
+            if (tpPrice > 0) {
+              try {
+                entryParams.takeProfit = session.exchangeInstance.priceToPrecision(marketSymbol, tpPrice);
+              } catch (e) {
+                entryParams.takeProfit = tpPrice.toString();
+              }
+            }
+            
             try {
-              const order = await safeCreateMarketOrder(session.exchangeInstance, marketSymbol, tradeSide, size, entryParams, (txt, typ) => session.addLog(txt, typ));
+              const order = await safeCreateMarketOrder(session, marketSymbol, tradeSide, size, entryParams, (txt, typ) => session.addLog(txt, typ));
               const fillPrice = order.price || order.average || tickerPrice;
 
-              session.activePositions[symbol] = {
+              // Verify and enforce protection post-fill for safety
+              const pIdx = session.isHedgeMode ? (decision.signal === 'BUY' ? 1 : 2) : 0;
+              const posType = decision.signal === 'BUY' ? 'LONG' : 'SHORT';
+              
+              await verifyAndEnforceProtection(session, symbol, pIdx, posType, fillPrice, slPrice, tpPrice);
+              
+              session.forceRefreshExchangeData = true;
+
+              const posKey = decision.signal === 'BUY' ? `${symbol}_LONG` : `${symbol}_SHORT`;
+              session.activePositions[posKey] = {
                 id: `live_${Date.now()}`,
                 type: decision.signal === 'BUY' ? 'LONG' : 'SHORT',
                 symbol: symbol,

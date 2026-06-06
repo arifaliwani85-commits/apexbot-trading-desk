@@ -11,6 +11,23 @@ interface TradeLogsProps {
   allPositions?: Position[];
   evaluationStates?: Record<string, any>;
   accountBalance?: number;
+  exchangeStatus?: {
+    connected: boolean;
+    exchangeId: string;
+    isTestnet: boolean;
+    balance: number;
+    equity?: number;
+    dailyDrawdownPercent?: number;
+    circuitBreakerTriggered?: boolean;
+    maskedApiKey?: string;
+    maskedApiSecret?: string;
+    isHedgeMode?: boolean;
+    rpm?: number;
+    rateLimitRemaining?: number;
+    lastRateLimitEvent?: number | null;
+    scanPaused?: boolean;
+    wsConnected?: boolean;
+  };
 }
 
 export const TradeLogs: React.FC<TradeLogsProps> = ({
@@ -22,6 +39,7 @@ export const TradeLogs: React.FC<TradeLogsProps> = ({
   allPositions = [],
   evaluationStates = {},
   accountBalance = 10000,
+  exchangeStatus,
 }) => {
   const [activeTab, setActiveTab] = useState<'positions' | 'logs' | 'history' | 'diagnostics'>('positions');
   const logEndRef = useRef<HTMLDivElement>(null);
@@ -47,6 +65,115 @@ export const TradeLogs: React.FC<TradeLogsProps> = ({
   };
 
   const livePnl = getLivePnl();
+
+  const renderProtectionBadges = (pos: Position) => {
+    if (pos.status === 'CLOSED') return null;
+    if (!pos.tpStatus) return null; // Only render for exchange live positions
+    
+    const tp = pos.tpStatus || 'MISSING';
+    const sl = pos.slStatus || 'MISSING';
+    const ts = pos.tsStatus || 'DISABLED';
+    
+    const getBadgeStyle = (status: string) => {
+      switch (status) {
+        case 'ATTACHED':
+          return { background: 'rgba(2, 192, 118, 0.15)', color: 'var(--accent-green)', border: '1px solid rgba(2, 192, 118, 0.3)' };
+        case 'PENDING':
+          return { background: 'rgba(240, 185, 11, 0.15)', color: 'var(--accent-gold)', border: '1px solid rgba(240, 185, 11, 0.3)' };
+        case 'MISSING':
+          return { background: 'rgba(246, 70, 93, 0.15)', color: 'var(--accent-red)', border: '1px solid rgba(246, 70, 93, 0.3)' };
+        case 'DISABLED':
+        default:
+          return { background: 'rgba(156, 163, 175, 0.1)', color: 'var(--text-muted)', border: '1px solid rgba(156, 163, 175, 0.2)' };
+      }
+    };
+
+    return (
+      <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '6px' }}>
+        <span style={{ fontSize: '10px', color: 'var(--text-secondary)' }}>Protection:</span>
+        <span className="badge" style={{ ...getBadgeStyle(tp), fontSize: '9px', padding: '2px 6px', borderRadius: '4px' }}>TP: {tp}</span>
+        <span className="badge" style={{ ...getBadgeStyle(sl), fontSize: '9px', padding: '2px 6px', borderRadius: '4px' }}>SL: {sl}</span>
+        <span className="badge" style={{ ...getBadgeStyle(ts), fontSize: '9px', padding: '2px 6px', borderRadius: '4px' }}>TS: {ts}</span>
+        
+        {pos.protectionWarning && (
+          <span className="badge pulse-warning" style={{ 
+            background: 'rgba(246, 70, 93, 0.2)', 
+            color: 'var(--accent-red)', 
+            fontSize: '9px', 
+            padding: '2px 6px',
+            fontWeight: 'bold',
+            marginLeft: 'auto',
+            borderRadius: '4px',
+            border: '1px solid var(--accent-red)'
+          }}>
+            ⚠️ {pos.protectionWarning}
+          </span>
+        )}
+      </div>
+    );
+  };
+
+  const renderApiHealthPanel = () => {
+    if (!exchangeStatus || !exchangeStatus.connected) return null;
+
+    const rpm = exchangeStatus.rpm || 0;
+    const remaining = exchangeStatus.rateLimitRemaining ?? 1000;
+    const isPaused = exchangeStatus.scanPaused;
+    const wsConnected = exchangeStatus.wsConnected;
+
+    return (
+      <div style={{
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '6px',
+        padding: '10px 16px',
+        background: 'var(--bg-secondary)',
+        borderBottom: '1px solid var(--border-color)',
+        fontSize: '11px'
+      }}>
+        {isPaused && (
+          <div className="pulse-warning" style={{
+            background: 'rgba(246, 70, 93, 0.15)',
+            border: '1px solid var(--accent-red)',
+            color: 'var(--accent-red)',
+            borderRadius: 'var(--radius-md)',
+            padding: '6px 10px',
+            fontWeight: 'bold',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '8px',
+            marginBottom: '4px'
+          }}>
+            <span>⚠️ API RATE LIMIT EXCEEDED - SCANNING TEMPORARILY PAUSED (60S)</span>
+          </div>
+        )}
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+            <span style={{ color: 'var(--text-secondary)' }}>Bybit API:</span>
+            <span className="badge" style={{ 
+              background: wsConnected ? 'rgba(2, 192, 118, 0.15)' : 'rgba(246, 70, 93, 0.15)', 
+              color: wsConnected ? 'var(--accent-green)' : 'var(--accent-red)',
+              fontSize: '9px',
+              padding: '1px 5px',
+              borderRadius: '4px'
+            }}>
+              {wsConnected ? 'WebSocket Active' : 'REST Polling'}
+            </span>
+          </div>
+          <div style={{ display: 'flex', gap: '12px', fontFamily: 'var(--font-mono)' }}>
+            <div>
+              <span style={{ color: 'var(--text-secondary)' }}>RPM:</span>{' '}
+              <span style={{ color: rpm > 50 ? 'var(--accent-gold)' : 'var(--text-primary)', fontWeight: 'bold' }}>{rpm}</span>
+            </div>
+            <div>
+              <span style={{ color: 'var(--text-secondary)' }}>Limit Remaining:</span>{' '}
+              <span style={{ color: remaining < 100 ? 'var(--accent-red)' : 'var(--text-primary)', fontWeight: 'bold' }}>{remaining}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  };
 
   return (
     <div className="logs-container" style={{ display: 'flex', flexDirection: 'column', height: '50%' }}>
@@ -81,6 +208,7 @@ export const TradeLogs: React.FC<TradeLogsProps> = ({
           BOT DIAGNOSTICS ({Object.keys(evaluationStates).length})
         </button>
       </div>
+      {renderApiHealthPanel()}
 
       <div style={{ flexGrow: 1, overflowY: 'auto', minHeight: 0 }}>
         {/* Positions Tab */}
@@ -240,35 +368,41 @@ export const TradeLogs: React.FC<TradeLogsProps> = ({
 
                         <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
                           {group.single && (
-                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 10px', background: 'var(--bg-secondary)', borderRadius: 'var(--radius-md)' }}>
-                              <div>
-                                <span className={`badge ${group.single.type === 'LONG' ? 'badge-long' : 'badge-short'}`} style={{ fontSize: '9px', marginRight: '6px' }}>
-                                  {group.single.type} {group.single.leverage}X
-                                </span>
-                                <span style={{ fontSize: '11px', color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)' }}>
-                                  Entry: ${group.single.entryPrice.toLocaleString(undefined, { minimumFractionDigits: 2 })} | SL: ${group.single.stopLoss.toLocaleString()} | TP: ${group.single.takeProfit.toLocaleString()}
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', padding: '8px 10px', background: 'var(--bg-secondary)', borderRadius: 'var(--radius-md)' }}>
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                                <div>
+                                  <span className={`badge ${group.single.type === 'LONG' ? 'badge-long' : 'badge-short'}`} style={{ fontSize: '9px', marginRight: '6px' }}>
+                                    {group.single.type} {group.single.leverage}X
+                                  </span>
+                                  <span style={{ fontSize: '11px', color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)' }}>
+                                    Entry: ${group.single.entryPrice.toLocaleString(undefined, { minimumFractionDigits: 2 })} | SL: ${group.single.stopLoss.toLocaleString()} | TP: ${group.single.takeProfit.toLocaleString()}
+                                  </span>
+                                </div>
+                                <span className={singlePnlVal >= 0 ? 'green-text' : 'red-text'} style={{ fontFamily: 'var(--font-mono)', fontWeight: 'bold', fontSize: '12px' }}>
+                                  {singlePnlVal >= 0 ? '+' : ''}${singlePnlVal.toFixed(2)} ({singlePnlVal >= 0 ? '+' : ''}{singlePct.toFixed(1)}%)
                                 </span>
                               </div>
-                              <span className={singlePnlVal >= 0 ? 'green-text' : 'red-text'} style={{ fontFamily: 'var(--font-mono)', fontWeight: 'bold', fontSize: '12px' }}>
-                                {singlePnlVal >= 0 ? '+' : ''}${singlePnlVal.toFixed(2)} ({singlePnlVal >= 0 ? '+' : ''}{singlePct.toFixed(1)}%)
-                              </span>
+                              {renderProtectionBadges(group.single)}
                             </div>
                           )}
 
                           {group.primary && (
-                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 10px', background: 'var(--bg-secondary)', borderRadius: 'var(--radius-md)', borderLeft: '3px solid var(--accent-blue)' }}>
-                              <div>
-                                <span className="badge" style={{ background: 'rgba(37, 99, 235, 0.15)', color: 'var(--accent-blue)', fontSize: '8px', padding: '1px 3px', marginRight: '6px' }}>PRIMARY</span>
-                                <span className={`badge ${group.primary.type === 'LONG' ? 'badge-long' : 'badge-short'}`} style={{ fontSize: '9px', marginRight: '6px' }}>
-                                  {group.primary.type} {group.primary.leverage}X
-                                </span>
-                                <span style={{ fontSize: '11px', color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)' }}>
-                                  Entry: ${group.primary.entryPrice.toLocaleString(undefined, { minimumFractionDigits: 2 })} | SL: ${group.primary.stopLoss.toLocaleString()} | TP: ${group.primary.takeProfit.toLocaleString()}
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', padding: '8px 10px', background: 'var(--bg-secondary)', borderRadius: 'var(--radius-md)', borderLeft: '3px solid var(--accent-blue)' }}>
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                                <div>
+                                  <span className="badge" style={{ background: 'rgba(37, 99, 235, 0.15)', color: 'var(--accent-blue)', fontSize: '8px', padding: '1px 3px', marginRight: '6px' }}>PRIMARY</span>
+                                  <span className={`badge ${group.primary.type === 'LONG' ? 'badge-long' : 'badge-short'}`} style={{ fontSize: '9px', marginRight: '6px' }}>
+                                    {group.primary.type} {group.primary.leverage}X
+                                  </span>
+                                  <span style={{ fontSize: '11px', color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)' }}>
+                                    Entry: ${group.primary.entryPrice.toLocaleString(undefined, { minimumFractionDigits: 2 })} | SL: ${group.primary.stopLoss.toLocaleString()} | TP: ${group.primary.takeProfit.toLocaleString()}
+                                  </span>
+                                </div>
+                                <span className={primaryPnlVal >= 0 ? 'green-text' : 'red-text'} style={{ fontFamily: 'var(--font-mono)', fontWeight: 'bold', fontSize: '12px' }}>
+                                  {primaryPnlVal >= 0 ? '+' : ''}${primaryPnlVal.toFixed(2)} ({primaryPnlVal >= 0 ? '+' : ''}{primaryPct.toFixed(1)}%)
                                 </span>
                               </div>
-                              <span className={primaryPnlVal >= 0 ? 'green-text' : 'red-text'} style={{ fontFamily: 'var(--font-mono)', fontWeight: 'bold', fontSize: '12px' }}>
-                                {primaryPnlVal >= 0 ? '+' : ''}${primaryPnlVal.toFixed(2)} ({primaryPnlVal >= 0 ? '+' : ''}{primaryPct.toFixed(1)}%)
-                              </span>
+                              {renderProtectionBadges(group.primary)}
                             </div>
                           )}
                           {!group.primary && isHedged && (
@@ -284,19 +418,22 @@ export const TradeLogs: React.FC<TradeLogsProps> = ({
                           )}
 
                           {group.hedge && (
-                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 10px', background: 'var(--bg-secondary)', borderRadius: 'var(--radius-md)', borderLeft: '3px solid var(--accent-gold)' }}>
-                              <div>
-                                <span className="badge" style={{ background: 'rgba(245, 158, 11, 0.15)', color: 'var(--accent-gold)', fontSize: '8px', padding: '1px 3px', marginRight: '6px' }}>HEDGE</span>
-                                <span className={`badge ${group.hedge.type === 'LONG' ? 'badge-long' : 'badge-short'}`} style={{ fontSize: '9px', marginRight: '6px' }}>
-                                  {group.hedge.type} {group.hedge.leverage}X
-                                </span>
-                                <span style={{ fontSize: '11px', color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)' }}>
-                                  Entry: ${group.hedge.entryPrice.toLocaleString(undefined, { minimumFractionDigits: 2 })} | SL: ${group.hedge.stopLoss.toLocaleString()} | TP: ${group.hedge.takeProfit.toLocaleString()}
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', padding: '8px 10px', background: 'var(--bg-secondary)', borderRadius: 'var(--radius-md)', borderLeft: '3px solid var(--accent-gold)' }}>
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                                <div>
+                                  <span className="badge" style={{ background: 'rgba(245, 158, 11, 0.15)', color: 'var(--accent-gold)', fontSize: '8px', padding: '1px 3px', marginRight: '6px' }}>HEDGE</span>
+                                  <span className={`badge ${group.hedge.type === 'LONG' ? 'badge-long' : 'badge-short'}`} style={{ fontSize: '9px', marginRight: '6px' }}>
+                                    {group.hedge.type} {group.hedge.leverage}X
+                                  </span>
+                                  <span style={{ fontSize: '11px', color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)' }}>
+                                    Entry: ${group.hedge.entryPrice.toLocaleString(undefined, { minimumFractionDigits: 2 })} | SL: ${group.hedge.stopLoss.toLocaleString()} | TP: ${group.hedge.takeProfit.toLocaleString()}
+                                  </span>
+                                </div>
+                                <span className={hedgePnlVal >= 0 ? 'green-text' : 'red-text'} style={{ fontFamily: 'var(--font-mono)', fontWeight: 'bold', fontSize: '12px' }}>
+                                  {hedgePnlVal >= 0 ? '+' : ''}${hedgePnlVal.toFixed(2)} ({hedgePnlVal >= 0 ? '+' : ''}{hedgePct.toFixed(1)}%)
                                 </span>
                               </div>
-                              <span className={hedgePnlVal >= 0 ? 'green-text' : 'red-text'} style={{ fontFamily: 'var(--font-mono)', fontWeight: 'bold', fontSize: '12px' }}>
-                                {hedgePnlVal >= 0 ? '+' : ''}${hedgePnlVal.toFixed(2)} ({hedgePnlVal >= 0 ? '+' : ''}{hedgePct.toFixed(1)}%)
-                              </span>
+                              {renderProtectionBadges(group.hedge)}
                             </div>
                           )}
                           {!group.hedge && isHedged && (
@@ -412,9 +549,10 @@ export const TradeLogs: React.FC<TradeLogsProps> = ({
                 </div>
 
                 {/* Real-time PnL block */}
+                {renderProtectionBadges(activePosition)}
                 <div
                   style={{
-                    marginTop: '16px',
+                    marginTop: '12px',
                     paddingTop: '12px',
                     borderTop: '1px solid var(--border-color)',
                     display: 'flex',

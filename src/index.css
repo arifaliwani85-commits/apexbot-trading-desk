@@ -826,3 +826,18 @@ input:checked + .slider:before {
   display: inline-flex;
   align-items: center;
 }
+
+@keyframes pulse-warning {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.6;
+    transform: scale(0.97);
+  }
+}
+.pulse-warning {
+  animation: pulse-warning 1.5s infinite ease-in-out;
+}
+
